@@ -4,7 +4,7 @@ import { useSelectionStore } from '../store/selectionStore';
 import { useHistoryStore } from '../store/historyStore';
 import { assetStorage } from '../services/assetStorage';
 import { arrangeNodes } from '../utils/layout';
-import { looksLikeVideoUrl, normalizeVideoDeliveryUrl } from '../services/videoService';
+import { getLocalLine4ThumbnailUrl } from '../utils/generatedImageStorage';
 import { NodeData, ToolMode } from '../../types';
 
 type AutoDownloadItem = {
@@ -98,7 +98,14 @@ export const useGenerationLogic = () => {
     }, []);
 
     // Init generations (placeholder nodes)
-    const handleInitGenerations = useCallback((count: number, prompt: string, aspectRatio: string = '1:1', baseNode?: NodeData, type: 'IMAGE' | 'VIDEO' = 'IMAGE') => {
+    const handleInitGenerations = useCallback((
+        count: number,
+        prompt: string,
+        aspectRatio: string = '1:1',
+        baseNode?: NodeData,
+        type: 'IMAGE' | 'VIDEO' = 'IMAGE',
+        options: { preserveToolMode?: boolean } = {},
+    ) => {
         let width = 512;
         let height = 512;
 
@@ -164,8 +171,10 @@ export const useGenerationLogic = () => {
         });
 
         setNodes(finalNodes);
-        // Switch to SELECT mode so user can see what's happening
-        setToolMode(ToolMode.SELECT);
+        if (!options.preserveToolMode) {
+            // Switch to SELECT mode so user can see what's happening
+            setToolMode(ToolMode.SELECT);
+        }
 
         // Auto-pan to new nodes
         const newIds = new Set(newNodes.map(n => n.id));
@@ -205,27 +214,12 @@ export const useGenerationLogic = () => {
     // Update generation
     const handleUpdateGeneration = useCallback(async (id: string, src: string | null, error?: string, taskId?: string) => {
         if (taskId) {
-            updateNode(
-              id,
-              {
-                taskId,
-                loading: true,
-                error: false,
-                errorMessage: undefined,
-                progress: 0,
-              },
-              true,
-            );
+            updateNode(id, { taskId, loading: true, error: false }, true);
             return;
         }
 
         if (error || !src || typeof src !== 'string') {
-        updateNode(id, {
-          loading: false,
-          error: true,
-          errorMessage: error || 'Invalid image source',
-          progress: 0,
-        });
+        updateNode(id, { loading: false, error: true, errorMessage: error || 'Invalid image source' });
         return;
         }
 
@@ -235,32 +229,36 @@ export const useGenerationLogic = () => {
         const currentNodes0 = useCanvasStore.getState().nodes;
         const currentNode0 = currentNodes0.find(n => n.id === id);
         const rawSrc = src;
-        const isVideo = looksLikeVideoUrl(rawSrc)
+        const isVideo = rawSrc.toLowerCase().endsWith('.mp4') 
+            || rawSrc.toLowerCase().includes('format=mp4')
+            || rawSrc.toLowerCase().includes('/video/')
             || currentNode0?.type === 'VIDEO';
 
         const currentNodes = useCanvasStore.getState().nodes;
         const currentNode = currentNodes.find(n => n.id === id);
         if (!currentNode) return;
+        const generatedAt = new Date().toISOString();
 
         // 1) Show result immediately with original URL first.
         // Avoid blocking first paint on local proxy latency.
-        const displaySrc = isVideo ? normalizeVideoDeliveryUrl(rawSrc) : rawSrc;
+        const displaySrc = rawSrc;
+        const thumbnailSrc = isVideo ? undefined : getLocalLine4ThumbnailUrl(displaySrc) || undefined;
 
         updateNode(id, {
             src: displaySrc,
+            thumbnailSrc,
             loading: false,
             error: false,
-            errorMessage: undefined,
-            taskId: undefined,
-            progress: 100,
-            opacity: 1
+            opacity: 1,
+            createdAt: generatedAt,
         }, true);
 
         const logId = addLog(
           currentNode.prompt || (isVideo ? "Generated Video" : "Generated Image"),
           displaySrc,
           undefined,
-          isVideo ? 'VIDEO' : (currentNode.type as 'IMAGE' | 'VIDEO')
+          isVideo ? 'VIDEO' : (currentNode.type as 'IMAGE' | 'VIDEO'),
+          thumbnailSrc,
         );
 
         if (!isVideo && useSelectionStore.getState().autoDownloadOnSuccess) {
@@ -301,8 +299,16 @@ export const useGenerationLogic = () => {
               const cachedUrl = await assetStorage.getAssetUrl(assetId);
 
               if (cachedUrl) {
-                updateNode(id, { src: cachedUrl, assetId }, true);
-                updateLogAsset(logId, assetId, cachedUrl);
+                // Some browsers/proxies can block blob: URL rendering in strict contexts.
+                // Keep the display URL as the original remote/proxy URL and only persist assetId.
+                if (cachedUrl.startsWith('blob:')) {
+                  updateNode(id, { assetId }, true);
+                  updateLogAsset(logId, assetId);
+                } else {
+                  const cachedThumb = getLocalLine4ThumbnailUrl(cachedUrl) || thumbnailSrc;
+                  updateNode(id, { src: cachedUrl, thumbnailSrc: cachedThumb, assetId }, true);
+                  updateLogAsset(logId, assetId, cachedUrl, cachedThumb);
+                }
               } else {
                 updateNode(id, { assetId }, true);
                 updateLogAsset(logId, assetId);

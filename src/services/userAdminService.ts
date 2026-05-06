@@ -1,4 +1,4 @@
-import {
+﻿import {
   AuthSessionPayload,
   AuthUserProfile,
   getAuthorizedBillingHeaders,
@@ -11,12 +11,13 @@ import {
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 
 export interface AdminManagedUser extends AuthUserProfile {
+  adminNote?: string;
   account: BillingAccountProfile | null;
 }
 
@@ -26,12 +27,15 @@ export interface AdminUserListPayload {
   page: number;
   pageSize: number;
   totalPages: number;
+  onlineTotal: number;
+  onlineWindowMinutes: number;
+  onlineUsers: AdminManagedUser[];
   users: AdminManagedUser[];
 }
 
 export interface AdminUserDetailPayload {
   success: boolean;
-  user: AuthUserProfile;
+  user: AuthUserProfile & { adminNote?: string };
   account: BillingAccountProfile | null;
   ledger: BillingLedgerPayload;
   pricing: BillingRoutePricing[];
@@ -106,6 +110,7 @@ export const updateAdminUserProfile = async ({
   displayName,
   role,
   status,
+  adminNote,
   ledgerPage = 1,
   ledgerPageSize = 20,
 }: {
@@ -113,6 +118,7 @@ export const updateAdminUserProfile = async ({
   displayName?: string;
   role?: AuthUserProfile['role'];
   status?: AuthUserProfile['status'];
+  adminNote?: string;
   ledgerPage?: number;
   ledgerPageSize?: number;
 }): Promise<AdminUserDetailPayload> => {
@@ -132,6 +138,7 @@ export const updateAdminUserProfile = async ({
         displayName,
         role,
         status,
+        adminNote,
       }),
     },
   );
@@ -139,59 +146,3 @@ export const updateAdminUserProfile = async ({
   return parseResponse<AdminUserDetailPayload>(response);
 };
 
-export const resetAdminUserPassword = async ({
-  userId,
-  ledgerPage = 1,
-  ledgerPageSize = 20,
-}: {
-  userId: string;
-  ledgerPage?: number;
-  ledgerPageSize?: number;
-}): Promise<AdminUserDetailPayload> => {
-  const params = new URLSearchParams();
-  params.set('ledgerPage', String(ledgerPage));
-  params.set('ledgerPageSize', String(ledgerPageSize));
-
-  const response = await fetch(
-    `${cleanUrl(API_BASE_URL)}/admin/users/${encodeURIComponent(userId)}/reset-password?${params.toString()}`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(await getAuthorizedBillingHeaders()),
-      },
-    },
-  );
-
-  return parseResponse<AdminUserDetailPayload>(response);
-};
-
-export const setAdminUserStatus = async ({
-  userId,
-  status,
-  ledgerPage = 1,
-  ledgerPageSize = 20,
-}: {
-  userId: string;
-  status: AuthUserProfile['status'];
-  ledgerPage?: number;
-  ledgerPageSize?: number;
-}): Promise<AdminUserDetailPayload> => {
-  const params = new URLSearchParams();
-  params.set('ledgerPage', String(ledgerPage));
-  params.set('ledgerPageSize', String(ledgerPageSize));
-
-  const response = await fetch(
-    `${cleanUrl(API_BASE_URL)}/admin/users/${encodeURIComponent(userId)}/status?${params.toString()}`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(await getAuthorizedBillingHeaders()),
-      },
-      body: JSON.stringify({ status }),
-    },
-  );
-
-  return parseResponse<AdminUserDetailPayload>(response);
-};

@@ -18,8 +18,15 @@ dist-ssr
 auth-data.json
 billing-data.json
 generation-records.json
+admin-change-logs.json
 announcement.json
 uploads/
+storage/
+mockups/
+classic-header-scheme1.png
+visionary_api_docs.html
+visionary_apidocs_chunk.js
+visionary_bundle.js
 .tmp-*.png
 tmp_*.png
 tmp_fix_*.ps1

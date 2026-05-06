@@ -3,9 +3,9 @@
 import { formatPoint } from '../src/utils/pointFormat';
 
 // API configuration
-// Production should use the relative /api path; local development uses http://localhost:3325/api.
+// Production should use the relative /api path; local development uses http://localhost:3355/api.
 const API_BASE_URL = typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 // Helper to determine model based on size
 const getModelBySize = (size: string): string => {
@@ -180,7 +180,7 @@ const handleApiError = async (response: Response) => {
         lowerErr.includes('credit') ||
         lowerErr.includes('quota')
     ) {
-        throw new Error('额度不足，请充值后重试');
+        throw new Error('额度不足，请联系管理员分配点数后重试');
     }
 
     throw new Error(`Submission Failed (${response.status}): ${errJson?.error || errText}`);
@@ -323,3 +323,4 @@ export const checkBalance = async (apiKey: string): Promise<any> => {
         throw new Error(e.message || "Failed to fetch balance");
     }
 };
+

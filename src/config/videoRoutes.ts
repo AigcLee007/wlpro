@@ -1,8 +1,8 @@
-import videoRouteCatalog from '../../config/videoRoutes.json';
+﻿import videoRouteCatalog from '../../config/videoRoutes.json';
 import { getVideoModelById } from './videoModels';
 import { roundNonNegativePoint } from '../utils/pointFormat';
 
-export type VideoRouteTransport = 'openai-video' | 'gemini-native';
+export type VideoRouteTransport = 'openai-video';
 export type VideoRouteMode = 'async';
 
 export interface VideoRouteConfig {
@@ -34,33 +34,9 @@ export interface VideoRouteCatalogShape {
   routes: VideoRouteConfig[];
 }
 
-const EMPTY_VIDEO_ROUTE: VideoRouteConfig = {
-  id: '__no_video_route__',
-  label: 'No Route',
-  description: 'No active route is available.',
-  routeFamily: 'default',
-  line: 'default',
-  transport: 'openai-video',
-  mode: 'async',
-  baseUrl: '',
-  generatePath: '/v2/videos/generations',
-  taskPath: '',
-  upstreamModel: '',
-  useRequestModel: true,
-  allowUserApiKeyWithoutLogin: false,
-  apiKeyEnv: '',
-  pointCost: 0,
-  isActive: false,
-  isDefaultRoute: false,
-  sortOrder: Number.MAX_SAFE_INTEGER,
-  hasApiKey: false,
-  createdAt: null,
-  updatedAt: null,
-};
-
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -171,8 +147,7 @@ export const getVideoRouteById = (routeId?: string): VideoRouteConfig => {
   return (
     VIDEO_ROUTES().find((route) => route.id === routeId) ||
     VIDEO_ROUTES().find((route) => route.id === DEFAULT_VIDEO_ROUTE_ID()) ||
-    VIDEO_ROUTES()[0] ||
-    EMPTY_VIDEO_ROUTE
+    VIDEO_ROUTES()[0]
   );
 };
 
@@ -183,15 +158,15 @@ const buildUserFacingVideoRouteLabel = (line: string, fallbackLabel?: string) =>
   const normalizedLine = String(line || '').trim().toLowerCase();
   const lineMatch = normalizedLine.match(/^line\s*([0-9]+)$/i);
   if (lineMatch?.[1]) {
-    return `Line ${lineMatch[1]}`;
+    return `线路 ${lineMatch[1]}`;
   }
 
   if (normalizedLine === 'default') {
-    return 'Default';
+    return '默认';
   }
 
   const sanitizedFallback = String(fallbackLabel || '').trim();
-  return sanitizedFallback || 'Route';
+  return sanitizedFallback || '线路';
 };
 
 export const getSelectedVideoRoute = (videoModel: string, videoLine?: string): VideoRouteConfig => {
@@ -251,3 +226,4 @@ export const getVideoModelNameForRoute = ({
   if (route.useRequestModel) return model.requestModel || model.id;
   return model.requestModel || model.id;
 };
+

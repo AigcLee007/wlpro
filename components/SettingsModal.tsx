@@ -1,12 +1,10 @@
 ﻿import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { X, Key, CreditCard, Loader2, History, Settings, RotateCcw, Trash2, Eye, EyeOff, Download, ImagePlus, Maximize2, DownloadCloud, Info, Film, AlertCircle, ChevronLeft, ChevronRight, ShieldCheck, Save } from 'lucide-react';
+import { X, Loader2, History, Settings, RotateCcw, Trash2, Download, ImagePlus, Maximize2, DownloadCloud, Info, Film, AlertCircle, ChevronLeft, ChevronRight, ShieldCheck } from 'lucide-react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { checkBalance } from '../services/geminiService';
 import { useHistoryStore } from '../src/store/historyStore';
 import { useSelectionStore } from '../src/store/selectionStore';
 import GlassModal from './GlassModal';
-import CoinIcon from './CoinIcon';
 import AuthPanel from './AuthPanel';
 import BillingPanel from './BillingPanel';
 import {
@@ -16,6 +14,12 @@ import {
 } from '../src/services/accountIdentity';
 import { clearGenerationRecords, fetchGenerationRecords } from '../src/services/generationRecordService';
 import type { GenerationLog } from '../src/store/historyStore';
+import {
+  getPreferredImageDisplayUrl,
+  isLocalLine4StoredImage,
+  isOlderThanHours,
+} from '../src/utils/generatedImageStorage';
+import { formatFullTime, formatRelativeTime } from '../src/utils/timeFormat';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -46,10 +50,13 @@ const ResolvedHistoryItem = ({
   isMobile?: boolean;
   blockActions?: boolean;
 }) => {
-  const [resolvedUrl, setResolvedUrl] = useState<string>(log.imageUrl);
+  const [resolvedUrl, setResolvedUrl] = useState<string>(
+    getPreferredImageDisplayUrl(log.imageUrl, log.thumbnailUrl),
+  );
   const [hasError, setHasError] = useState(false);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const touchMovedRef = useRef(false);
+  const originalUrl = log.imageUrl;
   const extractRawFromProxy = (url: string): string | null => {
     if (!url?.startsWith('/api/proxy/image?url=')) return null;
     try {
@@ -67,6 +74,11 @@ const ResolvedHistoryItem = ({
     }
     setHasError(true);
   };
+
+  useEffect(() => {
+    setResolvedUrl(getPreferredImageDisplayUrl(log.imageUrl, log.thumbnailUrl));
+    setHasError(false);
+  }, [log.imageUrl, log.thumbnailUrl]);
 
   useEffect(() => {
     let active = true;
@@ -90,11 +102,14 @@ const ResolvedHistoryItem = ({
   const actionBtnClass = isMobile
     ? "min-w-9 min-h-9 px-2 bg-white/10 active:bg-white/20 text-white rounded-lg transition-colors touch-manipulation active:scale-95"
     : "min-w-8 min-h-8 px-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-colors";
+  const relativeTime = formatRelativeTime(log.time);
+  const fullTime = formatFullTime(log.time);
   if (!isMobile) {
     return (
       <div
         key={log.id}
         className="relative group rounded-xl overflow-hidden"
+        title={fullTime ? `生成时间：${fullTime}` : undefined}
         draggable
         onDragStart={(e) => {
           e.dataTransfer.setData('text/plain', resolvedUrl);
@@ -121,11 +136,24 @@ const ResolvedHistoryItem = ({
             onError={handleMediaLoadError}
           />
         )}
+
+        {relativeTime && (
+          <div className="absolute left-2 bottom-2 rounded-full border border-white/10 bg-black/50 px-2 py-1 text-[10px] font-medium text-white/70 backdrop-blur-md transition-opacity duration-200 group-hover:opacity-0">
+            {relativeTime}
+          </div>
+        )}
         
         <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-all duration-200 flex flex-col justify-end p-2 pointer-events-none">
+          {fullTime && (
+            <div className="mb-auto flex justify-end">
+              <div className="rounded-full border border-white/10 bg-white/10 px-2 py-1 text-[10px] font-medium text-white/75 backdrop-blur-md">
+                生成时间：{fullTime}
+              </div>
+            </div>
+          )}
           <div className="flex justify-center gap-2 mb-2">
             <button 
-              onClick={() => onViewImage && onViewImage(resolvedUrl)}
+              onClick={() => onViewImage && onViewImage(originalUrl)}
               className="pointer-events-auto p-1.5 bg-white/20 hover:bg-blue-500 text-white rounded-lg backdrop-blur-sm transition-colors"
               title={historyMediaType === 'video' ? "播放" : "放大查看"}
             >
@@ -140,7 +168,7 @@ const ResolvedHistoryItem = ({
             </button>
             {historyMediaType === 'image' && (
               <button 
-                onClick={() => onUseAsReference && onUseAsReference(resolvedUrl)}
+                onClick={() => onUseAsReference && onUseAsReference(originalUrl)}
                 className="pointer-events-auto p-1.5 bg-white/20 hover:bg-purple-500 text-white rounded-lg backdrop-blur-sm transition-colors"
                 title="用作参考图"
               >
@@ -148,7 +176,7 @@ const ResolvedHistoryItem = ({
               </button>
             )}
             <button 
-              onClick={() => onDownloadImage && onDownloadImage(resolvedUrl, log.prompt, log.id)}
+              onClick={() => onDownloadImage && onDownloadImage(originalUrl, log.prompt, log.id)}
               className="pointer-events-auto p-1.5 bg-white/20 hover:bg-green-500 text-white rounded-lg backdrop-blur-sm transition-colors"
               title="下载"
             >
@@ -200,7 +228,7 @@ const ResolvedHistoryItem = ({
       <button
         type="button"
         className={`relative shrink-0 ${isMobile ? 'w-20' : 'w-24'} h-full rounded-lg overflow-hidden border border-white/10 bg-black/30 ${blockActions ? 'pointer-events-none opacity-70' : ''}`}
-        onClick={() => runActionSafely(() => onViewImage && onViewImage(resolvedUrl))}
+        onClick={() => runActionSafely(() => onViewImage && onViewImage(originalUrl))}
         title={historyMediaType === 'video' ? "播放" : "放大查看"}
       >
         {log.type === 'VIDEO' ? (
@@ -234,10 +262,15 @@ const ResolvedHistoryItem = ({
         <p className={`text-gray-300 leading-snug line-clamp-2 ${isMobile ? 'text-xs' : 'text-[11px]'}`}>
           {log.prompt || "无提示词"}
         </p>
+        {relativeTime && (
+          <div className="mt-1 text-[10px] text-gray-500" title={fullTime ? `生成时间：${fullTime}` : undefined}>
+            {relativeTime}
+          </div>
+        )}
         <div className="flex items-center gap-1.5 flex-wrap">
           <button
             type="button"
-            onClick={() => runActionSafely(() => onViewImage && onViewImage(resolvedUrl))}
+            onClick={() => runActionSafely(() => onViewImage && onViewImage(originalUrl))}
             className={`${actionBtnClass} ${blockActions ? 'pointer-events-none opacity-60' : ''}`}
             title={historyMediaType === 'video' ? "播放" : "查看"}
           >
@@ -254,7 +287,7 @@ const ResolvedHistoryItem = ({
           {historyMediaType === 'image' && (
             <button
               type="button"
-              onClick={() => runActionSafely(() => onUseAsReference && onUseAsReference(resolvedUrl))}
+              onClick={() => runActionSafely(() => onUseAsReference && onUseAsReference(originalUrl))}
               className={`${actionBtnClass} ${blockActions ? 'pointer-events-none opacity-60' : ''}`}
               title="用作参考图"
             >
@@ -263,7 +296,7 @@ const ResolvedHistoryItem = ({
           )}
           <button
             type="button"
-            onClick={() => runActionSafely(() => onDownloadImage && onDownloadImage(resolvedUrl, log.prompt, log.id))}
+            onClick={() => runActionSafely(() => onDownloadImage && onDownloadImage(originalUrl, log.prompt, log.id))}
             className={`${actionBtnClass} ${blockActions ? 'pointer-events-none opacity-60' : ''}`}
             title="下载"
           >
@@ -283,12 +316,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
   onUseAsReference,
   initialTab = 'settings'
 }) => {
-  const { apiKey, setApiKey, autoDownloadOnSuccess, setAutoDownloadOnSuccess } = useSelectionStore();
+  const { autoDownloadOnSuccess, setAutoDownloadOnSuccess } = useSelectionStore();
   const [activeTab, setActiveTab] = useState<'settings' | 'history'>(initialTab);
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [isCheckingBal, setIsCheckingBal] = useState(false);
   const [isDownloadingAll, setIsDownloadingAll] = useState(false);
-  const [balanceData, setBalanceData] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [isConfirmingClear, setIsConfirmingClear] = useState(false);
   const { logs = [], clearLogs } = useHistoryStore();
@@ -308,13 +338,15 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     completedAt: string | null;
     createdAt: string | null;
   }): GenerationLog | null => {
-    const primaryUrl = record.previewUrl || record.resultUrls?.[0] || '';
+    const originalUrl = record.resultUrls?.[0] || record.previewUrl || '';
+    const primaryUrl = record.previewUrl || originalUrl || '';
     if (!primaryUrl) return null;
     return {
       id: record.id,
       time: record.completedAt || record.createdAt || new Date().toISOString(),
       prompt: String(record.prompt || ''),
-      imageUrl: primaryUrl,
+      imageUrl: originalUrl,
+      thumbnailUrl: primaryUrl !== originalUrl ? primaryUrl : undefined,
       type: record.mediaType === 'VIDEO' ? 'VIDEO' : 'IMAGE',
     };
   }, []);
@@ -337,22 +369,24 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       setIsLoadingRemoteHistory(true);
       const result = await fetchGenerationRecords({
-        mediaType: 'all',
+        mediaType: historyMediaType,
         status: 'success',
+        uiMode: 'canvas',
+        days: 5,
         page: 1,
-        pageSize: 200,
+        pageSize: 24,
       });
       const mappedLogs = (Array.isArray(result.records) ? result.records : [])
         .map(mapGenerationRecordToLog)
         .filter((item): item is GenerationLog => Boolean(item));
       setRemoteLogs(mappedLogs);
     } catch (historyError: any) {
-      setError(historyError?.message || '加载云端历史失败');
+      setError(historyError?.message || '加载本地资产历史失败');
       setRemoteLogs([]);
     } finally {
       setIsLoadingRemoteHistory(false);
     }
-  }, [authSession?.authenticated, mapGenerationRecordToLog]);
+  }, [authSession?.authenticated, historyMediaType, mapGenerationRecordToLog]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -399,7 +433,13 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const filteredLogs = useMemo(() => effectiveLogs.filter(log => {
       const isVideo = log.type === 'VIDEO';
-      return historyMediaType === 'video' ? isVideo : !isVideo;
+      if (historyMediaType === 'video' ? !isVideo : isVideo) {
+        return false;
+      }
+      if (isLocalLine4StoredImage(log.imageUrl) && isOlderThanHours(log.time, 120)) {
+        return false;
+      }
+      return true;
   }), [effectiveLogs, historyMediaType]);
 
   const refreshHistoryViewport = useCallback(() => {
@@ -459,35 +499,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
 
 
 
-  const handleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setApiKey(e.target.value);
-  };
-
-  const handleCheckBalance = async () => {
-    if (!apiKey) {
-      setError("请先输入 API Key (密钥)");
-      return;
-    }
-    setIsCheckingBal(true);
-    setError(null);
-    try {
-      const data = await checkBalance(apiKey);
-      if (data.success) {
-        setBalanceData(data);
-      } else {
-        setError("查询失败：未知错误");
-      }
-    } catch (e: any) {
-      if (e.message.includes('fetch') || e.message.includes('Network Error')) {
-        setError("连接失败：请确保后端服务正在运行");
-      } else {
-        setError("查询失败：" + e.message);
-      }
-    } finally {
-      setIsCheckingBal(false);
-    }
-  };
-
   const handleReusePrompt = (prompt: string) => {
     if (onReusePrompt) {
       onReusePrompt(prompt, historyMediaType);
@@ -508,6 +519,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
         if (isRemoteHistoryEnabled) {
           await clearGenerationRecords({
             mediaType: historyMediaType === 'video' ? 'video' : 'image',
+            uiMode: 'canvas',
           });
           setRemoteLogs((prev) =>
             prev.filter((log) =>
@@ -564,7 +576,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     <GlassModal
       isOpen={isOpen}
       onClose={onClose}
-      title={activeTab === 'settings' ? '全局设置' : '历史记录'}
+      title={activeTab === 'settings' ? '企业账户' : '历史记录'}
       width="max-w-6xl"
       className="h-[85vh] relative"
     >
@@ -604,56 +616,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               )}
 
-              {!authSession?.authenticated && (
-                <>
-                  <div>
-                    <label className="text-xs font-medium text-gray-400 mb-2 flex items-center gap-1.5 uppercase tracking-wider">
-                      <Key size={12} /> API Key（可选）
-                    </label>
-                    <div className="flex gap-3">
-                      <div className="relative flex-1">
-                        <input
-                          type={showApiKey ? 'text' : 'password'}
-                          value={apiKey}
-                          onChange={handleApiKeyChange}
-                          placeholder="可选：用于查余额、提示词优化，以及免登录兼容模型"
-                          className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 pr-10 text-sm text-gray-200 placeholder-gray-600 focus:border-white/20 focus:bg-white/10 focus:outline-none transition-all"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowApiKey(!showApiKey)}
-                          className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors p-1"
-                          title={showApiKey ? '隐藏密钥' : '显示密钥'}
-                        >
-                          {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
-                        </button>
-                      </div>
-                      <button 
-                        onClick={onClose}
-                        className="bg-purple-600/80 hover:bg-purple-500 text-white px-5 py-3 rounded-xl flex items-center gap-2 text-sm font-medium transition-all active:scale-95 shadow-lg shadow-purple-500/20"
-                      >
-                        <Save size={16} /> 保存
-                      </button>
-                    </div>
-                    <p className="mt-2 text-xs leading-6 text-gray-500">
-                      如果你有自己的可用 Key，可以直接填在这里。验证通过后，前台只会展示支持直接使用
-                      API Key 的模型；其余需要登录和站内额度的模型会自动隐藏。
-                    </p>
-                  </div>
-
-                  <div className="flex gap-3">
-                    <button
-                      onClick={handleCheckBalance}
-                      disabled={isCheckingBal}
-                      className="w-full bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 hover:text-white text-sm py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95"
-                    >
-                      {isCheckingBal ? <Loader2 size={16} className="animate-spin" /> : <CreditCard size={16} />}
-                      查询余额
-                    </button>
-                  </div>
-                </>
-              )}
-
               <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl p-3.5">
                 <div className="flex items-start gap-2">
                   <Info size={14} className="text-amber-300 shrink-0 mt-0.5" />
@@ -684,38 +646,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                 </label>
               </div>
 
-              {/* Balance Display */}
-              {balanceData && (
-                <div className="bg-white/5 p-5 rounded-2xl border border-white/10 space-y-4">
-                  <div className="text-center">
-                    <div className="text-xs text-gray-500 mb-1 uppercase tracking-wider">剩余可用额度</div>
-                    <div className="text-4xl font-mono font-bold text-yellow-400 drop-shadow-[0_0_10px_rgba(250,204,21,0.2)] flex items-center justify-center gap-2">
-                      <CoinIcon size={28} className="drop-shadow-sm" />
-                      {balanceData.remaining_points}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="bg-black/20 p-3 rounded-xl border border-white/5 text-center">
-                      <div className="text-[10px] text-gray-500 mb-1">已用额度</div>
-                      <div className="text-sm font-mono text-gray-300 flex items-center justify-center gap-1">
-                        <CoinIcon size={14} />
-                        {balanceData.used_points}
-                      </div>
-                    </div>
-                    <div className="bg-black/20 p-3 rounded-xl border border-white/5 text-center">
-                      <div className="text-[10px] text-gray-500 mb-1">总额度</div>
-                      <div className="text-sm font-mono text-gray-300 flex items-center justify-center gap-1">
-                        <CoinIcon size={14} />
-                        {balanceData.total_points}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="text-[10px] text-gray-500 text-center pt-3 border-t border-white/5 leading-relaxed">
-                    {/* 规则说明已移除 */}
-                  </div>
-                </div>
-              )}
-
               {authSession?.user?.isAdmin === true && (
                 <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4 text-xs text-cyan-100/80">
                   公告管理已迁移到独立后台。请前往 <span className="font-medium text-cyan-50">/admin</span> 中的“公告管理”页面进行发布、置顶、启停和删除。
@@ -730,9 +660,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
 	                </div>
 	              )}
 
-	              <div className="rounded-2xl border border-blue-500/20 bg-blue-500/10 p-4 text-xs text-blue-100/80">
-	                当前站点为武陵商厦专属版，已移除外部购买与客服入口，账号点数请通过站内流程管理。
-	              </div>
 	            </div>
 	          ) : (
             /* History Tab */
@@ -760,7 +687,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
 
               {isRemoteHistoryEnabled && (
                 <div className="flex items-center justify-between rounded-xl border border-cyan-500/15 bg-cyan-500/5 px-3 py-2 text-[11px] text-cyan-100/80">
-                  <span>{isLoadingRemoteHistory ? '正在同步云端历史...' : '当前显示的是云端共享历史'}</span>
+                  <span>{isLoadingRemoteHistory ? '正在载入本地资产历史...' : '仅显示画布版最近 5 天本地资产历史'}</span>
                   {isLoadingRemoteHistory && <Loader2 size={12} className="animate-spin" />}
                 </div>
               )}

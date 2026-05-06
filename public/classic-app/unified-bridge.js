@@ -1,16 +1,13 @@
 ﻿(() => {
-  const API_BASE_URL =
-    typeof window !== "undefined" && window.location.hostname === "localhost"
-      ? "http://localhost:3355/api"
-      : "/api";
+  const API_BASE_URL = "/api";
   const AUTH_SESSION_STORAGE_KEY = "auth-session-v1";
   const CLASSIC_AUTH_MODE_KEY = "classic-auth-mode";
   const MODEL_STORAGE_KEY = "nb_image_model";
   const LINE_STORAGE_KEY = "nb_line";
   const KEY_STORAGE_KEY = "nb_key";
-  const USER_FACING_GENERATION_ERROR_MESSAGE =
-    "请检查提示词或参考图，可能触发了安全限制，请更换后重试";
+  const DEFAULT_CLASSIC_ERROR_MESSAGE = "生成失败，未返回错误详情";
   const SIZE_LABELS = {
+    auto: "自动",
     "1k": "1K (标准)",
     "2k": "2K (高清)",
     "3k": "3K (高精)",
@@ -27,8 +24,10 @@
 
   const LEDGER_TYPE_LABELS = {
     signup: "注册赠送",
-    recharge: "管理员充值",
+    recharge: "管理员分配",
     charge: "生成扣点",
+    prompt_optimize: "提示词优化",
+    reverse_prompt: "图片逆推",
     refund: "失败退款",
     admin_credit: "管理员加点",
     admin_debit: "管理员减点",
@@ -60,14 +59,16 @@
     passwordPanelOpen: false,
   };
   const remotePendingPollRegistry = new Set();
-  const REMOTE_PENDING_TTL_MS = 20 * 60 * 1000;
-  const isRecentPendingRecord = (record) => {
-    const createdAt = String(record?.createdAt || "").trim();
-    if (!createdAt) return true;
-    const ts = new Date(createdAt).getTime();
-    if (!Number.isFinite(ts) || Number.isNaN(ts)) return true;
-    return Date.now() - ts <= REMOTE_PENDING_TTL_MS;
+  const HISTORY_INITIAL_PAGE_SIZE = 15;
+  const HISTORY_REFRESH_DEBOUNCE_MS = 2000;
+  const HISTORY_REFRESH_MIN_INTERVAL_MS = 10000;
+  let remoteHistoryRecordsCache = [];
+  let remoteHistoryCursor = {
+    sinceCreatedAt: "",
+    sinceId: "",
   };
+  let historyRefreshTimer = null;
+  let lastHistoryRefreshAt = 0;
 
   const cleanUrl = (url) => String(url || "").replace(/\/$/, "");
   const escapeHtmlText = (value) =>
@@ -77,6 +78,45 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  const isMeaningfulClassicErrorText = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return false;
+    const normalized = text.toLowerCase();
+    return !["success", "succeeded", "ok", "completed"].includes(normalized);
+  };
+  const extractClassicApiError = (payload, fallback = DEFAULT_CLASSIC_ERROR_MESSAGE) => {
+    if (!payload) return fallback;
+    if (typeof payload === "string") {
+      return isMeaningfulClassicErrorText(payload) ? payload.trim() : fallback;
+    }
+    if (payload instanceof Error) {
+      return isMeaningfulClassicErrorText(payload.message) ? payload.message.trim() : fallback;
+    }
+    if (typeof payload === "object") {
+      const nested = payload.error;
+      const candidates = [
+        payload.fail_reason,
+        payload.failReason,
+        payload.reason,
+        payload.msg,
+        payload.error_message,
+        payload.errorMessage,
+        nested?.fail_reason,
+        nested?.failReason,
+        nested?.reason,
+        nested?.message,
+        typeof nested === "string" ? nested : "",
+        payload.message,
+        payload.details,
+        payload.code,
+      ];
+      const matched = candidates.find((item) => isMeaningfulClassicErrorText(item));
+      if (matched) {
+        return String(matched).trim();
+      }
+    }
+    return fallback;
+  };
   const sanitizeApiKey = (value) =>
     String(value || "")
       .replace(/[\u0000-\u001F\u007F]/g, "")
@@ -170,6 +210,268 @@
       throw new Error(data?.error || data?.message || "Request failed");
     }
     return data;
+  };
+  const classicPromptToolState = {
+    config: {
+      model: "gemini-3.1-pro-preview",
+      optimizeCost: 0.5,
+      reverseCost: 1,
+    },
+    reverseFile: null,
+    reverseResult: null,
+    reverseTab: "plain",
+  };
+  const fileToDataUrl = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("图片读取失败"));
+      reader.readAsDataURL(file);
+    });
+  const getClassicPromptText = () => String(document.getElementById("prompt")?.value || "").trim();
+  const setClassicPromptText = (value) => {
+    const promptEl = document.getElementById("prompt");
+    if (!promptEl) return;
+    promptEl.value = String(value || "");
+    promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+    promptEl.focus();
+  };
+  const loadClassicPromptToolConfig = async () => {
+    try {
+      const config = await fetchJson("/prompt-tools/config");
+      classicPromptToolState.config = {
+        model: String(config.model || "gemini-3.1-pro-preview"),
+        optimizeCost: toPointNumber(config.optimizeCost ?? 0.5, 0.5),
+        reverseCost: toPointNumber(config.reverseCost ?? 1, 1),
+      };
+      updateClassicPromptToolLabels();
+    } catch (_) {}
+  };
+  const updateClassicPromptToolLabels = () => {
+    const optimizeBtn = document.getElementById("classicOptimizePromptBtn");
+    if (optimizeBtn) {
+      optimizeBtn.textContent = `✨ 优化 ${formatPointValue(classicPromptToolState.config.optimizeCost)}金币`;
+      optimizeBtn.title = `使用 ${classicPromptToolState.config.model} 优化提示词`;
+    }
+    const reverseBtn = document.getElementById("classicReverseAnalyzeBtn");
+    if (reverseBtn) {
+      reverseBtn.textContent = `开始分析 · ${formatPointValue(classicPromptToolState.config.reverseCost)}金币`;
+    }
+    const topReverseBtn = document.getElementById("classicReversePromptBtn");
+    if (topReverseBtn) {
+      topReverseBtn.title = `图片逆推提示词，${formatPointValue(classicPromptToolState.config.reverseCost)}金币 / 次`;
+    }
+  };
+  const ensureClassicPromptToolSession = () => {
+    if (getStoredSessionToken()) return true;
+    if (typeof showSoftToast === "function") showSoftToast("请先登录后再使用提示词工具");
+    return false;
+  };
+  const setClassicPromptToolHeader = (title, cost) => {
+    const titleEl = document.getElementById("classicPromptToolTitle");
+    const subEl = document.getElementById("classicPromptToolSub");
+    if (titleEl) titleEl.textContent = title;
+    if (subEl) {
+      subEl.textContent = `${classicPromptToolState.config.model} · ${formatPointValue(cost)}金币 / 次`;
+    }
+  };
+  const showClassicPromptToolModal = (mode) => {
+    const modal = document.getElementById("classicPromptToolModal");
+    const optimizePanel = document.getElementById("classicOptimizePanel");
+    const reversePanel = document.getElementById("classicReversePanel");
+    if (!modal || !optimizePanel || !reversePanel) return;
+    optimizePanel.style.display = mode === "optimize" ? "block" : "none";
+    reversePanel.style.display = mode === "reverse" ? "block" : "none";
+    modal.style.display = "flex";
+  };
+  window.closeClassicPromptTool = function () {
+    const modal = document.getElementById("classicPromptToolModal");
+    if (modal) modal.style.display = "none";
+  };
+  window.handleClassicPromptToolBackdrop = function (event) {
+    if (event?.target?.id === "classicPromptToolModal") {
+      window.closeClassicPromptTool();
+    }
+  };
+  window.optimizeClassicPrompt = async function () {
+    const prompt = getClassicPromptText();
+    if (!prompt) {
+      if (typeof showSoftToast === "function") showSoftToast("请先输入提示词");
+      return;
+    }
+    if (!ensureClassicPromptToolSession()) return;
+
+    await loadClassicPromptToolConfig();
+    setClassicPromptToolHeader("提示词优化", classicPromptToolState.config.optimizeCost);
+    showClassicPromptToolModal("optimize");
+
+    const statusEl = document.getElementById("classicOptimizeStatus");
+    const optionsEl = document.getElementById("classicOptimizeOptions");
+    const btn = document.getElementById("classicOptimizePromptBtn");
+    if (statusEl) statusEl.textContent = "正在优化提示词...";
+    if (optionsEl) optionsEl.innerHTML = "";
+    if (btn) btn.disabled = true;
+
+    try {
+      const data = await fetchJson("/optimize-prompt", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildSessionHeaders(),
+        },
+        body: JSON.stringify({ prompt, type: "IMAGE" }),
+      });
+      if (!Array.isArray(data.options) || data.options.length === 0) {
+        throw new Error("优化失败：未返回结果");
+      }
+      if (statusEl) {
+        statusEl.textContent = `已扣 ${formatPointValue(data.cost ?? classicPromptToolState.config.optimizeCost)} 金币，余额 ${formatPointValue(data.billing?.remainingPoints ?? bridgeAuthState.account?.points ?? 0)} 点`;
+      }
+      if (optionsEl) {
+        optionsEl.innerHTML = "";
+        data.options.forEach((option, index) => {
+          const card = document.createElement("div");
+          card.className = "classic-optimize-card";
+          const title = document.createElement("div");
+          title.className = "classic-optimize-title";
+          title.textContent = option.style || `优化方案 ${index + 1}`;
+          const text = document.createElement("pre");
+          text.className = "classic-optimize-text";
+          text.textContent = option.prompt || "";
+          const actions = document.createElement("div");
+          actions.className = "classic-optimize-actions";
+          const copyBtn = document.createElement("button");
+          copyBtn.className = "classic-inline-tool-btn";
+          copyBtn.textContent = "复制";
+          copyBtn.onclick = () => {
+            navigator.clipboard.writeText(option.prompt || "");
+            if (typeof showSoftToast === "function") showSoftToast("已复制优化提示词");
+          };
+          const useBtn = document.createElement("button");
+          useBtn.className = "classic-prompt-primary-btn compact";
+          useBtn.textContent = "使用此方案";
+          useBtn.onclick = () => {
+            setClassicPromptText(option.prompt || "");
+            window.closeClassicPromptTool();
+          };
+          actions.append(copyBtn, useBtn);
+          card.append(title, text, actions);
+          optionsEl.appendChild(card);
+        });
+      }
+      await refreshClassicSession(false);
+    } catch (error) {
+      if (statusEl) statusEl.textContent = error?.message || "优化失败，请稍后重试";
+    } finally {
+      if (btn) btn.disabled = false;
+      updateClassicPromptToolLabels();
+    }
+  };
+  window.openClassicReversePrompt = async function (event) {
+    if (event?.stopPropagation) event.stopPropagation();
+    if (!ensureClassicPromptToolSession()) return;
+    await loadClassicPromptToolConfig();
+    setClassicPromptToolHeader("图片逆推提示词", classicPromptToolState.config.reverseCost);
+    showClassicPromptToolModal("reverse");
+    updateClassicPromptToolLabels();
+  };
+  window.handleClassicReverseFileChange = function (event) {
+    const file = event?.target?.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      if (typeof showSoftToast === "function") showSoftToast("请上传有效的图片文件");
+      return;
+    }
+    if (file.size > 4 * 1024 * 1024) {
+      if (typeof showSoftToast === "function") showSoftToast("图片大小不能超过 4MB");
+      return;
+    }
+    classicPromptToolState.reverseFile = file;
+    classicPromptToolState.reverseResult = null;
+    const upload = document.getElementById("classicReverseUpload");
+    const previewWrap = document.getElementById("classicReversePreviewWrap");
+    const preview = document.getElementById("classicReversePreview");
+    const analyzeBtn = document.getElementById("classicReverseAnalyzeBtn");
+    const result = document.getElementById("classicReverseResult");
+    if (upload) upload.style.display = "none";
+    if (previewWrap) previewWrap.style.display = "grid";
+    if (result) result.style.display = "none";
+    if (analyzeBtn) analyzeBtn.disabled = false;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (preview) preview.src = String(reader.result || "");
+    };
+    reader.readAsDataURL(file);
+  };
+  const getClassicReverseResultText = () => {
+    const result = classicPromptToolState.reverseResult;
+    if (!result) return "";
+    return classicPromptToolState.reverseTab === "json"
+      ? JSON.stringify(result.jsonPrompt || {}, null, 2)
+      : String(result.plainPrompt || result.prompt || "");
+  };
+  const renderClassicReverseResult = () => {
+    const textEl = document.getElementById("classicReverseResultText");
+    const resultWrap = document.getElementById("classicReverseResult");
+    const plainTab = document.getElementById("classicPlainPromptTab");
+    const jsonTab = document.getElementById("classicJsonPromptTab");
+    if (textEl) textEl.textContent = getClassicReverseResultText();
+    if (resultWrap) resultWrap.style.display = classicPromptToolState.reverseResult ? "block" : "none";
+    if (plainTab) plainTab.classList.toggle("active", classicPromptToolState.reverseTab === "plain");
+    if (jsonTab) jsonTab.classList.toggle("active", classicPromptToolState.reverseTab === "json");
+  };
+  window.setClassicReverseResultTab = function (tab) {
+    classicPromptToolState.reverseTab = tab === "json" ? "json" : "plain";
+    renderClassicReverseResult();
+  };
+  window.analyzeClassicReversePrompt = async function () {
+    if (!classicPromptToolState.reverseFile) return;
+    if (!ensureClassicPromptToolSession()) return;
+    const statusEl = document.getElementById("classicReverseStatus");
+    const btn = document.getElementById("classicReverseAnalyzeBtn");
+    if (statusEl) statusEl.textContent = "正在分析图片...";
+    if (btn) btn.disabled = true;
+    try {
+      const image = await fileToDataUrl(classicPromptToolState.reverseFile);
+      const data = await fetchJson("/reverse-prompt", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildSessionHeaders(),
+        },
+        body: JSON.stringify({ image }),
+      });
+      const plainPrompt = String(data.plainPrompt || data.prompt || "").trim();
+      if (!plainPrompt) throw new Error("逆推失败：未返回结果");
+      classicPromptToolState.reverseResult = {
+        plainPrompt,
+        prompt: plainPrompt,
+        jsonPrompt: data.jsonPrompt && typeof data.jsonPrompt === "object" ? data.jsonPrompt : { subject: plainPrompt },
+      };
+      classicPromptToolState.reverseTab = "plain";
+      if (statusEl) {
+        statusEl.textContent = `已扣 ${formatPointValue(data.cost ?? classicPromptToolState.config.reverseCost)} 金币，余额 ${formatPointValue(data.billing?.remainingPoints ?? bridgeAuthState.account?.points ?? 0)} 点`;
+      }
+      renderClassicReverseResult();
+      await refreshClassicSession(false);
+    } catch (error) {
+      if (statusEl) statusEl.textContent = error?.message || "分析失败，请稍后重试";
+    } finally {
+      if (btn) btn.disabled = false;
+      updateClassicPromptToolLabels();
+    }
+  };
+  window.copyClassicReverseResult = function () {
+    const text = getClassicReverseResultText();
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    if (typeof showSoftToast === "function") showSoftToast("已复制提示词");
+  };
+  window.useClassicReverseResult = function () {
+    const text = getClassicReverseResultText();
+    if (!text) return;
+    setClassicPromptText(text);
+    window.closeClassicPromptTool();
   };
   const formatClassicPoints = (value) => `${formatPointValue(value)} 点`;
   const formatClassicDateTime = (value) => {
@@ -290,23 +592,40 @@
 
     Object.entries(overrides).forEach(([rawKey, rawValue]) => {
       const key = normalizeSizeKey(rawKey);
+      const upstreamModel = String(rawValue?.upstreamModel || "").trim();
       const parsedPointCost = Number.parseFloat(String(rawValue?.pointCost ?? ""));
-      if (!key || !Number.isFinite(parsedPointCost) || parsedPointCost < 0) {
+      if (!key) {
         return;
       }
-      const pointCost = toPointNumber(parsedPointCost, 0);
-      next[key] = { pointCost };
+      const entry = {};
+      if (upstreamModel) {
+        entry.upstreamModel = upstreamModel;
+      }
+      if (Number.isFinite(parsedPointCost) && parsedPointCost >= 0) {
+        entry.pointCost = toPointNumber(parsedPointCost, 0);
+      }
+      if (entry.upstreamModel || Number.isFinite(entry.pointCost)) {
+        next[key] = entry;
+      }
     });
 
     return next;
   };
   const normalizeRoute = (raw = {}) => ({
     id: String(raw.id || "").trim(),
-    label: String(raw.label || raw.id || "Route").trim(),
+    label: String(raw.label || raw.id || "线路").trim(),
     modelFamily: String(raw.modelFamily || "default").trim(),
     line: String(raw.line || "default").trim(),
     transport: String(raw.transport || "openai-image").trim(),
     mode: String(raw.mode || "async").trim(),
+    baseUrl: String(raw.baseUrl || "").trim(),
+    generatePath: String(raw.generatePath || "").trim(),
+    taskPath: String(raw.taskPath || "").trim(),
+    editPath: String(raw.editPath || "").trim(),
+    chatPath: String(raw.chatPath || "").trim(),
+    upstreamModel: String(raw.upstreamModel || "").trim(),
+    useRequestModel: raw.useRequestModel === true,
+    requiresDataUriReferences: raw.requiresDataUriReferences === true,
     pointCost: toPointNumber(raw.pointCost || 0, 0),
     sizeOverrides: normalizeSizeOverrides(raw.sizeOverrides),
     isActive: raw.isActive !== false,
@@ -346,12 +665,20 @@
       getRoutesForModel(model.id).some((route) => route.allowUserApiKeyWithoutLogin === true),
     );
   };
+  const normalizeRouteLineKey = (value) => {
+    const raw = String(value || "").trim();
+    const lineMatch = raw.match(/^line\s*([0-9]+)$/i);
+    if (lineMatch?.[1]) return `line${lineMatch[1]}`;
+    const digitMatch = raw.match(/^([0-9]+)$/);
+    if (digitMatch?.[1]) return `line${digitMatch[1]}`;
+    return raw.toLowerCase() || "default";
+  };
   const getFriendlyRouteLabel = (route) => {
-    const line = String(route?.line || "").trim();
-    const match = line.match(/^line\s*([0-9]+)$/i);
-    if (match?.[1]) return `Line ${match[1]}`;
+    const line = normalizeRouteLineKey(route?.line);
+    const match = line.match(/^line([0-9]+)$/i);
+    if (match?.[1]) return `线路 ${match[1]}`;
     if (line.toLowerCase() === "default") return "默认线路";
-    return String(route?.label || route?.id || "Route").trim() || "Route";
+    return String(route?.label || route?.id || "线路").trim() || "线路";
   };
   const getCurrentModel = () => {
     const visibleModels = getVisibleModels();
@@ -378,9 +705,9 @@
   const getCurrentRoute = () => {
     const visibleRoutes = getVisibleRoutesForCurrentModel();
     if (visibleRoutes.length === 0) return null;
-    const storedLine = String(localStorage.getItem(LINE_STORAGE_KEY) || "").trim();
+    const storedLine = normalizeRouteLineKey(localStorage.getItem(LINE_STORAGE_KEY) || "");
     const selected =
-      visibleRoutes.find((route) => route.line === storedLine) ||
+      visibleRoutes.find((route) => normalizeRouteLineKey(route.line) === storedLine) ||
       visibleRoutes.find((route) => route.isDefaultRoute) ||
       visibleRoutes.find((route) => route.isDefaultNanoBananaLine) ||
       visibleRoutes[0];
@@ -413,17 +740,323 @@
     }
     return toPointNumber(route?.pointCost || 0, 0);
   };
+  const getRouteSizeOverride = (route, size) => {
+    const normalizedSize = normalizeSizeKey(size);
+    if (!normalizedSize) return null;
+    return route?.sizeOverrides?.[normalizedSize] || null;
+  };
+  const getClassicRequestModelForSize = (selectedModel, selectedRoute, size) => {
+    const sizeOverride = getRouteSizeOverride(selectedRoute, size);
+    if (sizeOverride?.upstreamModel) return sizeOverride.upstreamModel;
+    if (selectedRoute?.upstreamModel) return selectedRoute.upstreamModel;
+    return selectedModel?.requestModel || selectedModel?.id || "";
+  };
   const getDisplayRouteForModel = (modelId, preferredLine = "") => {
     const routes = getRoutesForModel(modelId).filter((route) =>
       isApiKeyCompatibilityMode() ? route.allowUserApiKeyWithoutLogin === true : true,
     );
     if (routes.length === 0) return null;
+    const preferredLineKey = normalizeRouteLineKey(preferredLine);
     return (
-      routes.find((route) => route.line === String(preferredLine || "").trim()) ||
+      routes.find((route) => normalizeRouteLineKey(route.line) === preferredLineKey) ||
       routes.find((route) => route.isDefaultRoute) ||
       routes.find((route) => route.isDefaultNanoBananaLine) ||
       routes[0]
     );
+  };
+  const getLowestCostRouteForModel = (modelId, size) => {
+    const routes = getRoutesForModel(modelId).filter((route) =>
+      isApiKeyCompatibilityMode() ? route.allowUserApiKeyWithoutLogin === true : true,
+    );
+    if (routes.length === 0) return null;
+    return [...routes].sort((left, right) => {
+      const leftCost = getRoutePointCost(left, size);
+      const rightCost = getRoutePointCost(right, size);
+      if (leftCost !== rightCost) return leftCost - rightCost;
+
+      const leftDefault = left.isDefaultRoute || left.isDefaultNanoBananaLine ? 1 : 0;
+      const rightDefault = right.isDefaultRoute || right.isDefaultNanoBananaLine ? 1 : 0;
+      if (leftDefault !== rightDefault) return rightDefault - leftDefault;
+
+      if ((left.sortOrder || 0) !== (right.sortOrder || 0)) {
+        return (left.sortOrder || 0) - (right.sortOrder || 0);
+      }
+
+      return String(left.label || "").localeCompare(String(right.label || ""));
+    })[0];
+  };
+  const isGptImage2Model = (model, requestModel = "") => {
+    const modelId = String(model?.id || "").trim();
+    const resolvedRequestModel = String(requestModel || model?.requestModel || "").trim();
+    return (
+      modelId === "gpt-image-2" ||
+      resolvedRequestModel === "gpt-image-2" ||
+      resolvedRequestModel === "gpt-image-2-all"
+    );
+  };
+  const isGeminiNativeSyncRoute = (route) =>
+    String(route?.transport || "").trim() === "gemini-native" &&
+    String(route?.mode || "").trim() === "sync";
+  const stripAspectRatioSuffix = (promptText) =>
+    String(promptText || "")
+      .replace(/\s*--ar\s*\d+\s*[:：]\s*\d+/gi, "")
+      .trim();
+  const GPT_SIZE_PATTERN = /^\s*(\d+)\s*[xX]\s*(\d+)\s*$/;
+  const GPT_RATIO_PATTERN = /^\s*(\d+(?:\.\d+)?)\s*[:xX]\s*(\d+(?:\.\d+)?)\s*$/;
+  const GPT_IMAGE_SIZE_MULTIPLE = 16;
+  const GPT_IMAGE_MAX_EDGE = 3840;
+  const GPT_IMAGE_MAX_ASPECT_RATIO = 3;
+  const GPT_IMAGE_MIN_PIXELS = 655360;
+  const GPT_IMAGE_MAX_PIXELS = 8294400;
+  const roundToMultiple = (value, multiple) =>
+    Math.max(multiple, Math.round(Number(value || 0) / multiple) * multiple);
+  const floorToMultiple = (value, multiple) =>
+    Math.max(multiple, Math.floor(Number(value || 0) / multiple) * multiple);
+  const ceilToMultiple = (value, multiple) =>
+    Math.max(multiple, Math.ceil(Number(value || 0) / multiple) * multiple);
+  const normalizeGptImageSize = (size) => {
+    const trimmed = String(size || "").trim();
+    const match = trimmed.match(GPT_SIZE_PATTERN);
+    if (!match) return trimmed;
+    const normalized = normalizeGptImageDimensions(Number(match[1]), Number(match[2]));
+    return `${normalized.width}x${normalized.height}`;
+  };
+  const parseGptRatio = (ratio) => {
+    const match = String(ratio || "").trim().match(GPT_RATIO_PATTERN);
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return null;
+    }
+    return { width, height };
+  };
+  const normalizeGptImageDimensions = (width, height) => {
+    let normalizedWidth = roundToMultiple(width, GPT_IMAGE_SIZE_MULTIPLE);
+    let normalizedHeight = roundToMultiple(height, GPT_IMAGE_SIZE_MULTIPLE);
+    const scaleToFit = (scale) => {
+      normalizedWidth = floorToMultiple(normalizedWidth * scale, GPT_IMAGE_SIZE_MULTIPLE);
+      normalizedHeight = floorToMultiple(normalizedHeight * scale, GPT_IMAGE_SIZE_MULTIPLE);
+    };
+    const scaleToFill = (scale) => {
+      normalizedWidth = ceilToMultiple(normalizedWidth * scale, GPT_IMAGE_SIZE_MULTIPLE);
+      normalizedHeight = ceilToMultiple(normalizedHeight * scale, GPT_IMAGE_SIZE_MULTIPLE);
+    };
+
+    for (let i = 0; i < 4; i += 1) {
+      const maxEdge = Math.max(normalizedWidth, normalizedHeight);
+      if (maxEdge > GPT_IMAGE_MAX_EDGE) {
+        scaleToFit(GPT_IMAGE_MAX_EDGE / maxEdge);
+      }
+      if (normalizedWidth / normalizedHeight > GPT_IMAGE_MAX_ASPECT_RATIO) {
+        normalizedWidth = floorToMultiple(normalizedHeight * GPT_IMAGE_MAX_ASPECT_RATIO, GPT_IMAGE_SIZE_MULTIPLE);
+      } else if (normalizedHeight / normalizedWidth > GPT_IMAGE_MAX_ASPECT_RATIO) {
+        normalizedHeight = floorToMultiple(normalizedWidth * GPT_IMAGE_MAX_ASPECT_RATIO, GPT_IMAGE_SIZE_MULTIPLE);
+      }
+
+      const pixels = normalizedWidth * normalizedHeight;
+      if (pixels > GPT_IMAGE_MAX_PIXELS) {
+        scaleToFit(Math.sqrt(GPT_IMAGE_MAX_PIXELS / pixels));
+      } else if (pixels < GPT_IMAGE_MIN_PIXELS) {
+        scaleToFill(Math.sqrt(GPT_IMAGE_MIN_PIXELS / pixels));
+      }
+    }
+
+    return { width: normalizedWidth, height: normalizedHeight };
+  };
+  const calculateClassicGptImageSize = (size, ratio) => {
+    const normalizedSize = String(size || "").trim().toLowerCase();
+    if (normalizedSize === "auto") return "auto";
+    if (GPT_SIZE_PATTERN.test(normalizedSize)) return normalizeGptImageSize(normalizedSize);
+
+    const tier = normalizedSize === "4k" ? "4k" : normalizedSize === "2k" ? "2k" : "1k";
+    const parsedRatio = parseGptRatio(ratio) || { width: 1, height: 1 };
+    const ratioWidth = parsedRatio.width;
+    const ratioHeight = parsedRatio.height;
+
+    if (ratioWidth === ratioHeight) {
+      const side = tier === "1k" ? 1024 : tier === "2k" ? 2048 : 3840;
+      const normalized = normalizeGptImageDimensions(side, side);
+      return `${normalized.width}x${normalized.height}`;
+    }
+
+    let width;
+    let height;
+    if (tier === "1k") {
+      const shortSide = 1024;
+      width =
+        ratioWidth > ratioHeight
+          ? roundToMultiple((shortSide * ratioWidth) / ratioHeight, GPT_IMAGE_SIZE_MULTIPLE)
+          : shortSide;
+      height =
+        ratioWidth > ratioHeight
+          ? shortSide
+          : roundToMultiple((shortSide * ratioHeight) / ratioWidth, GPT_IMAGE_SIZE_MULTIPLE);
+    } else {
+      const longSide = tier === "2k" ? 2048 : 3840;
+      width =
+        ratioWidth > ratioHeight
+          ? longSide
+          : roundToMultiple((longSide * ratioWidth) / ratioHeight, GPT_IMAGE_SIZE_MULTIPLE);
+      height =
+        ratioWidth > ratioHeight
+          ? roundToMultiple((longSide * ratioHeight) / ratioWidth, GPT_IMAGE_SIZE_MULTIPLE)
+          : longSide;
+    }
+
+    const normalized = normalizeGptImageDimensions(width, height);
+    return `${normalized.width}x${normalized.height}`;
+  };
+  const getClassicGptSettings = () =>
+    typeof window.getClassicGptSettings === "function"
+      ? window.getClassicGptSettings()
+      : {
+          quality: "auto",
+          outputFormat: "png",
+          outputCompression: null,
+          moderation: "auto",
+        };
+  const getGrokPrompt = (basePrompt, ratio, size, modelName) => {
+    if (!String(modelName || "").startsWith("grok-")) return basePrompt;
+    return `${basePrompt}，${ratio}，超高品质${String(size || "").toUpperCase()}分辨率`;
+  };
+  const buildClassicGptPayload = ({
+    selectedModel,
+    selectedRoute,
+    requestModel,
+    prompt,
+    size,
+    ratio,
+    n = 1,
+  }) => {
+    const gptSettings = getClassicGptSettings();
+    const payload = {
+      model: requestModel || getClassicRequestModelForSize(selectedModel, selectedRoute, size),
+      modelId: selectedModel.id,
+      routeId: selectedRoute.id,
+      uiMode: "classic",
+      prompt,
+      size: calculateClassicGptImageSize(size, ratio),
+      image_size: size,
+      quality: gptSettings.quality,
+      output_format: gptSettings.outputFormat,
+      moderation: gptSettings.moderation,
+      n,
+    };
+    if (gptSettings.outputFormat !== "png" && gptSettings.outputCompression !== null) {
+      payload.output_compression = Math.max(
+        0,
+        Math.min(100, Math.round(Number(gptSettings.outputCompression))),
+      );
+    }
+    return payload;
+  };
+  const buildClassicGeminiPayload = ({
+    selectedModel,
+    selectedRoute,
+    prompt,
+    ratio,
+    size,
+    quantity,
+    referenceImages,
+  }) => {
+    const parts = [{ text: prompt }];
+    referenceImages.forEach((imageValue) => {
+      const rawValue = String(imageValue || "").trim();
+      if (!rawValue) return;
+      const match = rawValue.match(/^data:([^;]+);base64,(.+)$/);
+      if (match) {
+        parts.push({
+          inlineData: {
+            mimeType: match[1],
+            data: match[2],
+          },
+        });
+      } else {
+        parts.push({
+          inlineData: {
+            mimeType: "image/jpeg",
+            data: rawValue,
+          },
+        });
+      }
+    });
+    return {
+      model: String(selectedModel.requestModel || selectedModel.id || "").trim(),
+      modelId: selectedModel.id,
+      routeId: selectedRoute.id,
+      uiMode: "classic",
+      prompt,
+      aspect_ratio: ratio,
+      image_size: String(size || "1K").trim().toUpperCase(),
+      strict_native_config: true,
+      n: quantity,
+      contents: [
+        {
+          role: "user",
+          parts,
+        },
+      ],
+      generationConfig: {
+        imageConfig: {
+          aspectRatio: ratio,
+          imageSize: String(size || "1K").trim().toUpperCase(),
+        },
+        candidateCount: quantity,
+      },
+    };
+  };
+  const createClassicCollageFromSrcs = async (srcs) => {
+    if (!Array.isArray(srcs) || srcs.length === 0) return "";
+    return new Promise((resolve, reject) => {
+      const loadedImages = [];
+      let loadedCount = 0;
+      let hasError = false;
+      srcs.forEach((src) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+          if (hasError) return;
+          loadedCount += 1;
+          if (loadedCount === srcs.length) renderCollage();
+        };
+        img.onerror = () => {
+          hasError = true;
+          reject(new Error("加载参考图失败"));
+        };
+        img.src = src;
+        loadedImages.push(img);
+      });
+      const renderCollage = () => {
+        const gap = 10;
+        let maxHeight = 0;
+        loadedImages.forEach((img) => {
+          maxHeight = Math.max(maxHeight, img.height);
+        });
+        const scale = maxHeight > 1024 ? 1024 / maxHeight : 1;
+        let scaledTotalWidth = 0;
+        loadedImages.forEach((img) => {
+          scaledTotalWidth += img.width * scale + gap;
+        });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(scaledTotalWidth - gap));
+        canvas.height = Math.max(1, Math.round(maxHeight * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("Canvas 创建失败"));
+          return;
+        }
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        let currentX = 0;
+        loadedImages.forEach((img) => {
+          const width = img.width * scale;
+          ctx.drawImage(img, currentX, 0, width, img.height * scale);
+          currentX += width + gap;
+        });
+        resolve(canvas.toDataURL("image/jpeg", 0.9));
+      };
+    });
   };
   const renderModelMenu = () => {
     const pill = document.getElementById("modelPill");
@@ -433,7 +1066,6 @@
 
     const models = getVisibleModels();
     const selectedSize = getCurrentSelectedSize();
-    const preferredLine = String(localStorage.getItem(LINE_STORAGE_KEY) || "").trim();
     if (models.length === 0) {
       menu.innerHTML = '<div class="dropdown-item active" data-value=""><span>暂无可用模型</span></div>';
       pill.setAttribute("data-selected-value", "");
@@ -450,7 +1082,7 @@
     const selected = getCurrentModel();
     menu.innerHTML = models
       .map((model) => {
-        const displayRoute = getDisplayRouteForModel(model.id, preferredLine);
+        const displayRoute = getLowestCostRouteForModel(model.id, selectedSize);
         const costLabel = formatCoinLabel(
           displayRoute ? getRoutePointCost(displayRoute, selectedSize) : model.selectorCost,
         );
@@ -473,7 +1105,7 @@
       triggerLabel.innerText = selected ? `${icon ? `${icon} ` : ""}${selected.label}` : "暂无可用模型";
     }
     if (triggerVal) {
-      const selectedRoute = selected ? getDisplayRouteForModel(selected.id, preferredLine) : null;
+      const selectedRoute = selected ? getLowestCostRouteForModel(selected.id, selectedSize) : null;
       const selectedCost = formatCoinLabel(
         selectedRoute ? getRoutePointCost(selectedRoute, selectedSize) : selected?.selectorCost || 0,
       );
@@ -568,30 +1200,46 @@
     }
   };
   const updateBrandHeader = () => {
+    const currentModel = getCurrentModel();
     const titleEl = document.getElementById("brandTitleText");
     const subEl = document.getElementById("brandSubText");
     const badgeEl = document.getElementById("brandBadge4k");
 
     if (titleEl) {
-      titleEl.textContent = "武陵商厦";
+      titleEl.textContent = currentModel?.label || "Classic Create";
     }
     if (subEl) {
       if (isSessionAuthenticated()) {
-        subEl.textContent = "企业账号已连接，可使用站内点数与模型";
+        subEl.textContent = "统一账户已连接，当前使用主站登录与点数";
       } else if (getStoredApiKey()) {
-        subEl.textContent = "已启用 API Key 模式，可使用兼容线路";
+        subEl.textContent = "旧 Key 兼容模式已启用，可直连兼容线路";
       } else {
-        subEl.textContent = "请先登录企业账号或输入有效 API Key";
+        subEl.textContent = "登录后可使用全部模型；旧 API Key 兼容部分线路";
       }
     }
     if (badgeEl) {
-      badgeEl.style.display = "inline-flex";
-      badgeEl.textContent = "武陵商厦";
+      const supports4k = (currentModel?.sizeOptions || []).includes("4k");
+      badgeEl.style.display = supports4k ? "inline-flex" : "none";
     }
   };
   const updateLegacyAdminVisibility = () => {
     const adminSection = document.getElementById("adminNoticeSection");
     if (adminSection) adminSection.style.display = "none";
+  };
+  const syncClassicPriceUi = () => {
+    const updatePriceCard =
+      typeof window.updateCurrentPriceCard === "function"
+        ? window.updateCurrentPriceCard
+        : typeof updateCurrentPriceCard === "function"
+          ? updateCurrentPriceCard
+          : null;
+    if (typeof updatePriceCard === "function") updatePriceCard();
+
+    const priceOverlay = document.getElementById("priceOverlay");
+    const isPriceOpen = priceOverlay && priceOverlay.style.display === "flex";
+    if (isPriceOpen && typeof window.renderPriceTable === "function") {
+      window.renderPriceTable();
+    }
   };
   const applyAccountSummaryToProfile = (account) => {
     const balanceArea = document.getElementById("balanceDisplayArea");
@@ -792,6 +1440,13 @@
     updateRatioAvailabilityForModel();
     updateBrandHeader();
     updateLegacyAdminVisibility();
+    if (typeof window.updateClassicRefUploadHint === "function") {
+      window.updateClassicRefUploadHint();
+    }
+    if (typeof window.updateClassicGptSettingsUi === "function") {
+      window.updateClassicGptSettingsUi();
+    }
+    syncClassicPriceUi();
   };
   window.refreshClassicCatalogUi = renderCatalogUi;
   const loadClassicCatalogs = async () => {
@@ -1361,16 +2016,28 @@
     }
     return Array.from(new Set(directUrls.filter(Boolean)));
   };
-  const fetchGenerationRecords = async ({ mediaType = "all", status = "all", page = 1, pageSize = 100 } = {}) =>
-    fetchJson(
-      `/generation-records?mediaType=${encodeURIComponent(mediaType)}&status=${encodeURIComponent(status)}&page=${encodeURIComponent(page)}&pageSize=${encodeURIComponent(pageSize)}`,
-      {
-        headers: {
-          "Content-Type": "application/json",
-          ...buildSessionHeaders(),
-        },
+  const fetchGenerationRecords = async ({
+    mediaType = "all",
+    status = "all",
+    page = 1,
+    pageSize = HISTORY_INITIAL_PAGE_SIZE,
+    sinceCreatedAt = "",
+    sinceId = "",
+  } = {}) => {
+    const params = new URLSearchParams();
+    params.set("mediaType", String(mediaType || "all"));
+    params.set("status", String(status || "all"));
+    params.set("page", String(page || 1));
+    params.set("pageSize", String(pageSize || HISTORY_INITIAL_PAGE_SIZE));
+    if (sinceCreatedAt) params.set("sinceCreatedAt", String(sinceCreatedAt));
+    if (sinceId) params.set("sinceId", String(sinceId));
+    return fetchJson(`/generation-records?${params.toString()}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...buildSessionHeaders(),
       },
-    );
+    });
+  };
   const deleteGenerationRecords = async ({ mediaType = "all" } = {}) =>
     fetchJson(`/generation-records?mediaType=${encodeURIComponent(mediaType)}`, {
       method: "DELETE",
@@ -1379,12 +2046,94 @@
         ...buildSessionHeaders(),
       },
     });
+  const dedupeHistoryRecords = (records = []) => {
+    const seen = new Set();
+    const ordered = [];
+    (Array.isArray(records) ? records : []).forEach((record) => {
+      const recordId = String(record?.id || "").trim();
+      const urlKey = String(record?.resultUrls?.[0] || record?.previewUrl || "").trim();
+      const key = urlKey || recordId || `${record?.createdAt || ""}:${record?.previewUrl || ""}`;
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      ordered.push(record);
+    });
+    ordered.sort((a, b) => {
+      const aTime = String(a?.createdAt || "");
+      const bTime = String(b?.createdAt || "");
+      return bTime.localeCompare(aTime);
+    });
+    return ordered;
+  };
+  const getHistoryCursorFromRecords = (records = []) => {
+    const first = Array.isArray(records) ? records[0] : null;
+    return {
+      sinceCreatedAt: String(first?.createdAt || "").trim(),
+      sinceId: String(first?.id || "").trim(),
+    };
+  };
+  const isHistoryTabVisible = () => {
+    const historyTab = document.getElementById("tab-gallery");
+    return Boolean(historyTab && historyTab.classList.contains("active"));
+  };
+  const scheduleRemoteHistoryRefresh = () => {
+    if (!isSessionAuthenticated()) return;
+    if (!isHistoryTabVisible()) return;
+    if (historyRefreshTimer) return;
+
+    historyRefreshTimer = window.setTimeout(async () => {
+      historyRefreshTimer = null;
+      if (!isSessionAuthenticated() || !isHistoryTabVisible()) return;
+      const elapsed = Date.now() - lastHistoryRefreshAt;
+      if (elapsed < HISTORY_REFRESH_MIN_INTERVAL_MS) {
+        scheduleRemoteHistoryRefresh();
+        return;
+      }
+      await loadHistory({ incremental: true, force: false });
+    }, HISTORY_REFRESH_DEBOUNCE_MS);
+  };
   const formatHistoryClock = (isoString) => {
     if (!isoString) return "";
     const date = new Date(isoString);
     if (Number.isNaN(date.getTime())) return "";
     return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
   };
+  const readLocalClassicHistoryRecords = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem("nb_history") || "[]");
+      return (Array.isArray(raw) ? raw : [])
+        .map((item) => {
+          const fullUrl =
+            typeof item === "string"
+              ? item
+              : String(item?.fullUrl || item?.url || "").trim();
+          if (!fullUrl) return null;
+          const previewUrl =
+            typeof item === "string"
+              ? (typeof getClassicLine4ThumbUrl === "function" && getClassicLine4ThumbUrl(item)) || item
+              : String(item?.previewUrl || item?.displayUrl || item?.url || fullUrl).trim();
+          const completedAt =
+            typeof item === "object" && item?.completedAt
+              ? String(item.completedAt)
+              : typeof item === "object" && item?.createdAt
+                ? String(item.createdAt)
+                : new Date().toISOString();
+          return {
+            id: `local:${typeof item === "object" && item?.id ? item.id : fullUrl}`,
+            resultUrls: [fullUrl],
+            previewUrl: previewUrl || fullUrl,
+            prompt: typeof item === "object" ? String(item.prompt || "") : "",
+            createdAt: completedAt,
+            completedAt,
+            localOnly: true,
+          };
+        })
+        .filter(Boolean);
+    } catch (_) {
+      return [];
+    }
+  };
+  const mergeRemoteAndLocalHistoryRecords = (records = []) =>
+    dedupeHistoryRecords([...readLocalClassicHistoryRecords(), ...(Array.isArray(records) ? records : [])]);
   const renderRemoteHistoryGrid = async (records = []) => {
     if (typeof clearHistoryObjectUrlRefs === "function") {
       clearHistoryObjectUrlRefs();
@@ -1393,15 +2142,18 @@
     if (!grid) return;
     grid.innerHTML = "";
 
-    if (!Array.isArray(records) || records.length === 0) {
+    const mergedRecords = mergeRemoteAndLocalHistoryRecords(records);
+
+    if (!Array.isArray(mergedRecords) || mergedRecords.length === 0) {
       grid.innerHTML =
         '<div style="color:var(--text-sub); grid-column:1/-1; text-align:center; padding:20px; font-size:12px;">暂无历史记录</div>';
       return;
     }
 
-    records.forEach((record) => {
-      const url = String(record.previewUrl || record.resultUrls?.[0] || "").trim();
-      if (!url) return;
+    mergedRecords.forEach((record) => {
+      const originalUrl = String(record.resultUrls?.[0] || record.previewUrl || "").trim();
+      const url = String(record.previewUrl || originalUrl || "").trim();
+      if (!originalUrl) return;
       const recordId = String(record.id || "").trim();
       const prompt = String(record.prompt || "");
       const encodedPrompt = encodeURIComponent(prompt || "");
@@ -1412,17 +2164,19 @@
       const div = document.createElement("div");
       div.className = "result-item history-item";
       div.title = promptLabel;
+      div.dataset.fullUrl = originalUrl;
+      div.dataset.displayUrl = url;
       div.innerHTML = `
-        <img src="${url}" loading="lazy" onclick="openLightbox(this.src)">
+        <img src="${url}" loading="lazy" onclick="openLightbox(this.closest('.history-item').dataset.fullUrl || this.src)">
         ${time ? `<div class="history-time-tag">${time}</div>` : ""}
         <div class="history-cache-badge syncing">缓存中</div>
         ${promptTooltip}
         <div class="item-overlay">
-          <button class="overlay-btn history-icon-btn" data-label="放大" onclick="openLightbox(this.closest('.history-item').querySelector('img').src)">🔍</button>
-          <button class="overlay-btn history-icon-btn" data-label="保存" onclick="downloadSingleImg(this.closest('.history-item').querySelector('img').src)">💾</button>
+          <button class="overlay-btn history-icon-btn" data-label="放大" onclick="openLightbox(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">🔍</button>
+          <button class="overlay-btn history-icon-btn" data-label="保存" onclick="downloadSingleImg(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">💾</button>
           <button class="overlay-btn history-icon-btn" data-label="重生" onclick="regenerateFromHistory('${encodedPrompt}')">♻️</button>
-          <button class="overlay-btn history-icon-btn" data-label="垫图" onclick="useAsRef(this.closest('.history-item').querySelector('img').src)">🧩</button>
-          <button class="overlay-btn history-icon-btn" data-label="链接" onclick="copyImgUrl('${url}')">🔗</button>
+          <button class="overlay-btn history-icon-btn" data-label="垫图" onclick="useAsRef(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">🧩</button>
+          <button class="overlay-btn history-icon-btn" data-label="链接" onclick="copyImgUrl(this.closest('.history-item').dataset.fullUrl || '${originalUrl}')">🔗</button>
         </div>
       `;
       grid.appendChild(div);
@@ -1435,7 +2189,7 @@
         getCachedHistoryImage(recordId).then((blob) => {
           if (!blob) {
             if (typeof cacheHistoryImage === "function") {
-              cacheHistoryImage(recordId, url).then((ok) => {
+              cacheHistoryImage(recordId, originalUrl).then((ok) => {
                 if (ok && typeof setHistoryCacheBadge === "function") {
                   setHistoryCacheBadge(div, "local");
                 }
@@ -1485,14 +2239,26 @@
     typeof removePendingTask === "function" ? removePendingTask.bind(window) : null;
   const legacyRestorePendingTasks =
     typeof restorePendingTasks === "function" ? restorePendingTasks.bind(window) : null;
+  const legacySwitchTab =
+    typeof switchTab === "function" ? switchTab.bind(window) : null;
 
-  saveToHistory = function (url, promptText = "") {
-    if (!isSessionAuthenticated()) {
-      return legacySaveToHistory ? legacySaveToHistory(url, promptText) : undefined;
+  if (legacySwitchTab) {
+    switchTab = function (tabName) {
+      legacySwitchTab(tabName);
+      if (isSessionAuthenticated() && String(tabName || "").trim().toLowerCase() === "gallery") {
+        void loadHistory({ incremental: false, force: true });
+      }
+    };
+  }
+
+  saveToHistory = function (url, promptText = "", previewUrl = "") {
+    if (legacySaveToHistory) {
+      legacySaveToHistory(url, promptText, previewUrl);
     }
-    setTimeout(() => {
-      void loadHistory();
-    }, 120);
+    if (!isSessionAuthenticated()) {
+      return undefined;
+    }
+    scheduleRemoteHistoryRefresh();
     return undefined;
   };
 
@@ -1532,19 +2298,36 @@
     });
   };
 
-  loadHistory = async function () {
+  loadHistory = async function ({ incremental = false, force = true } = {}) {
     if (!isSessionAuthenticated()) {
+      remoteHistoryRecordsCache = [];
+      remoteHistoryCursor = {
+        sinceCreatedAt: "",
+        sinceId: "",
+      };
       return legacyLoadHistory ? legacyLoadHistory() : undefined;
     }
 
     try {
+      const useIncremental =
+        incremental &&
+        Boolean(remoteHistoryCursor.sinceCreatedAt) &&
+        (!force || isHistoryTabVisible());
       const result = await fetchGenerationRecords({
         mediaType: "image",
         status: "success",
         page: 1,
-        pageSize: 100,
+        pageSize: HISTORY_INITIAL_PAGE_SIZE,
+        sinceCreatedAt: useIncremental ? remoteHistoryCursor.sinceCreatedAt : "",
+        sinceId: useIncremental ? remoteHistoryCursor.sinceId : "",
       });
-      await renderRemoteHistoryGrid(Array.isArray(result?.records) ? result.records : []);
+      const incoming = Array.isArray(result?.records) ? result.records : [];
+      remoteHistoryRecordsCache = useIncremental
+        ? dedupeHistoryRecords([...incoming, ...remoteHistoryRecordsCache]).slice(0, 200)
+        : dedupeHistoryRecords(incoming);
+      remoteHistoryCursor = getHistoryCursorFromRecords(remoteHistoryRecordsCache);
+      lastHistoryRefreshAt = Date.now();
+      await renderRemoteHistoryGrid(remoteHistoryRecordsCache);
     } catch (error) {
       console.warn("[Classic Bridge] load remote history failed:", error);
       if (legacyLoadHistory) {
@@ -1582,18 +2365,31 @@
         pageSize: 100,
       });
       const records = Array.isArray(result?.records) ? result.records : [];
-      const activePendingRecords = records.filter(
-        (record) => record?.taskId && isRecentPendingRecord(record),
-      );
-      renderRemotePendingTasks(activePendingRecords);
-      activePendingRecords
+      renderRemotePendingTasks(records);
+      records
         .filter((record) => record?.taskId)
         .forEach((record, index) => {
+          if (typeof window.ensureClassicLiveTaskForPending === "function") {
+            window.ensureClassicLiveTaskForPending({
+              taskId: record.taskId,
+              prompt: record.prompt || "",
+              size: String(record.outputSize || "1K"),
+              modelLabel: record.modelId || record.model || "",
+              routeLabel: record.routeId || record.route || "",
+              index: index + 1,
+              status: "running",
+              createdAt: record.createdAt ? new Date(record.createdAt).getTime() : Date.now(),
+            });
+          }
           if (remotePendingPollRegistry.has(record.taskId)) return;
           remotePendingPollRegistry.add(record.taskId);
           pollSingleTask(record.taskId, "", String(record.outputSize || "1K"), index + 1, {
             trackUi: false,
             route: getCurrentRoute(),
+            taskId: record.taskId,
+            promptSnapshot: record.prompt || "",
+            modelLabel: record.modelId || record.model || "",
+            routeLabel: record.routeId || record.route || "",
           });
         });
     } catch (error) {
@@ -1601,9 +2397,31 @@
     }
   };
   submitSingleTask = async function (payload, key, size, index, options = {}) {
+    const liveTaskIds = Array.isArray(options.liveTaskIds)
+      ? options.liveTaskIds.filter(Boolean)
+      : options.liveTaskId
+        ? [options.liveTaskId]
+        : [];
+    const liveTaskForSlot = (slot = 0) => liveTaskIds[slot] || liveTaskIds[0] || "";
+    const promptSnapshot = String(
+      options.promptSnapshot || document.getElementById("prompt")?.value?.trim() || "",
+    );
+    const failLiveTasks = (message) => {
+      if (typeof window.failClassicLiveTask !== "function") return;
+      const ids = liveTaskIds.length > 0 ? liveTaskIds : [options.taskId].filter(Boolean);
+      ids.forEach((liveId) => {
+        window.failClassicLiveTask(liveId, message, {
+          prompt: promptSnapshot,
+          size,
+          modelLabel: options.modelLabel || "",
+          routeLabel: options.routeLabel || "",
+        });
+      });
+    };
     try {
       const route = options.route || getCurrentRoute();
-      const response = await fetch(CONFIG.submitUrl, {
+      const endpoint = String(options.endpoint || CONFIG.submitUrl || "/api/generate").trim();
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: buildGenerateHeaders(route, key),
         body: JSON.stringify(payload),
@@ -1611,7 +2429,7 @@
 
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+        throw new Error(extractClassicApiError(data, `请求失败 (${response.status})`));
       }
       if (data.warning) {
         showSoftToast(String(data.warning));
@@ -1619,17 +2437,45 @@
 
       const directImageUrls = extractImmediateImageUrls(data);
       if (directImageUrls.length > 0) {
-        const promptText = document.getElementById("prompt")?.value?.trim() || "";
-        directImageUrls.forEach((imageUrl) => {
+        const promptText = promptSnapshot;
+        const expectedCount = Math.max(1, Number(options.expectedCount || directImageUrls.length || 1));
+        directImageUrls.forEach((imageUrl, imageIndex) => {
+          const liveTaskId = liveTaskForSlot(imageIndex);
+          if (liveTaskId && typeof window.completeClassicLiveTask === "function") {
+            window.completeClassicLiveTask(liveTaskId, imageUrl, {
+              prompt: promptText,
+              size,
+              modelLabel: options.modelLabel || "",
+              routeLabel: options.routeLabel || "",
+            });
+          }
           if (canUpdateMainUi(options.runToken, options.trackUi !== false)) {
             appendImageToGrid(imageUrl, size, null, {
               runToken: options.runToken,
               trackUi: options.trackUi !== false,
+              liveTaskId,
+              promptSnapshot: promptText,
+              modelLabel: options.modelLabel || "",
+              routeLabel: options.routeLabel || "",
             });
           } else {
             saveToHistory(imageUrl, promptText);
           }
         });
+        const missingCount = Math.max(0, expectedCount - directImageUrls.length);
+        for (let missingIndex = 0; missingIndex < missingCount; missingIndex += 1) {
+          const liveTaskId = liveTaskForSlot(directImageUrls.length + missingIndex);
+          if (liveTaskId && typeof window.failClassicLiveTask === "function") {
+            window.failClassicLiveTask(liveTaskId, DEFAULT_CLASSIC_ERROR_MESSAGE, {
+              prompt: promptText,
+              size,
+              modelLabel: options.modelLabel || "",
+              routeLabel: options.routeLabel || "",
+            });
+          }
+          if (!canUpdateMainUi(options.runToken, options.trackUi !== false)) break;
+          handleSingleError(DEFAULT_CLASSIC_ERROR_MESSAGE, size);
+        }
         return;
       }
 
@@ -1639,6 +2485,16 @@
       }
 
       const directKeyForTask = shouldUseDirectApiKeyForRoute(route, key) ? key : "";
+      const liveTaskId = liveTaskForSlot(0);
+      if (typeof window.promoteClassicLiveTask === "function") {
+        window.promoteClassicLiveTask(liveTaskId || taskId, taskId, {
+          prompt: promptSnapshot,
+          size,
+          modelLabel: options.modelLabel || "",
+          routeLabel: options.routeLabel || "",
+          status: "running",
+        });
+      }
       savePendingTask(
         taskId,
         directKeyForTask,
@@ -1651,11 +2507,25 @@
       pollSingleTask(taskId, directKeyForTask, size, index, {
         ...options,
         route,
+        liveTaskIds,
+        liveTaskId,
+        taskId,
       });
     } catch (error) {
       console.error("[Classic Bridge] submit task failed:", error);
+      const errorMessage = extractClassicApiError(error);
+      failLiveTasks(errorMessage);
       if (!canUpdateMainUi(options.runToken, options.trackUi !== false)) return;
-      handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+      const expectedCount = Math.max(1, Number(options.expectedCount || 1));
+      for (let failureIndex = 0; failureIndex < expectedCount; failureIndex += 1) {
+        handleSingleError(errorMessage, size);
+      }
+    } finally {
+      if (typeof options.onSubmitSettled === "function") {
+        try {
+          options.onSubmitSettled();
+        } catch (_) {}
+      }
     }
   };
   pollSingleTask = async function (taskId, key, size, index, options = {}) {
@@ -1664,8 +2534,40 @@
     let successNoUrlCount = 0;
     const maxSuccessNoUrlCount = 3;
     const startedAt = Date.now();
-    const maxPollMs = 8 * 60 * 1000;
+    const maxPollMs = 10 * 60 * 1000;
     const trackUi = options.trackUi !== false;
+    const liveTaskIds = Array.isArray(options.liveTaskIds)
+      ? options.liveTaskIds.filter(Boolean)
+      : options.liveTaskId
+        ? [options.liveTaskId]
+        : [];
+    const promptSnapshot = String(
+      options.promptSnapshot || document.getElementById("prompt")?.value?.trim() || "",
+    );
+    const liveTaskForSlot = (slot = 0) => liveTaskIds[slot] || liveTaskIds[0] || taskId;
+    const completeLiveTask = (imageUrl, slot = 0) => {
+      if (typeof window.completeClassicLiveTask !== "function") return;
+      window.completeClassicLiveTask(liveTaskForSlot(slot), imageUrl, {
+        taskId,
+        prompt: promptSnapshot,
+        size,
+        modelLabel: options.modelLabel || "",
+        routeLabel: options.routeLabel || "",
+      });
+    };
+    const failLiveTask = (message) => {
+      if (typeof window.failClassicLiveTask !== "function") return;
+      const ids = liveTaskIds.length > 0 ? liveTaskIds : [taskId];
+      ids.forEach((liveId) => {
+        window.failClassicLiveTask(liveId, message, {
+          taskId,
+          prompt: promptSnapshot,
+          size,
+          modelLabel: options.modelLabel || "",
+          routeLabel: options.routeLabel || "",
+        });
+      });
+    };
 
     const checkLoop = setInterval(async () => {
       try {
@@ -1673,8 +2575,9 @@
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          failLiveTask("查询超时，任务状态未完成");
           if (canUpdateMainUi(options.runToken, trackUi)) {
-            handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+            handleSingleError("查询超时，任务状态未完成", size);
           }
           return;
         }
@@ -1692,8 +2595,9 @@
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          failLiveTask("任务已失效或未找到");
           if (canUpdateMainUi(options.runToken, trackUi)) {
-            handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+            handleSingleError("任务已失效或未找到", size);
           }
           return;
         }
@@ -1717,13 +2621,19 @@
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          completeLiveTask(imageUrls[0], 0);
           if (canUpdateMainUi(options.runToken, trackUi)) {
             appendImageToGrid(imageUrls[0], size, null, {
               runToken: options.runToken,
               trackUi,
+              liveTaskId: liveTaskForSlot(0),
+              taskId,
+              promptSnapshot,
+              modelLabel: options.modelLabel || "",
+              routeLabel: options.routeLabel || "",
             });
           } else {
-            saveToHistory(imageUrls[0], document.getElementById("prompt")?.value?.trim() || "");
+            saveToHistory(imageUrls[0], promptSnapshot);
           }
           return;
         }
@@ -1734,19 +2644,22 @@
             clearInterval(checkLoop);
             removePendingTask(taskId);
             removePendingTaskFromGallery(taskId);
+            failLiveTask("任务成功但未返回图片链接");
             if (canUpdateMainUi(options.runToken, trackUi)) {
-              handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+              handleSingleError("任务成功但未返回图片链接", size);
             }
           }
           return;
         }
 
-        if (statusRaw === "FAILURE" || statusRaw === "FAILED") {
+        if (statusRaw === "FAILURE" || statusRaw === "FAILED" || statusRaw === "ERROR") {
+          const failureMessage = extractClassicApiError(rawJson, "生成失败");
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          failLiveTask(failureMessage);
           if (canUpdateMainUi(options.runToken, trackUi)) {
-            handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+            handleSingleError(failureMessage, size);
           }
         }
       } catch (error) {
@@ -1756,12 +2669,14 @@
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          const errorMessage = extractClassicApiError(error, "查询连接持续失败");
+          failLiveTask(errorMessage);
           if (canUpdateMainUi(options.runToken, trackUi)) {
-            handleSingleError(USER_FACING_GENERATION_ERROR_MESSAGE, size);
+            handleSingleError(errorMessage, size);
           }
         }
       }
-    }, 2000);
+    }, 5000);
   };
   runGen = async function () {
     const key = getStoredApiKey();
@@ -1834,11 +2749,12 @@
     }
 
     btn.disabled = true;
-    imgContainer.style.display = "none";
+    btn.innerHTML = "提交中...";
+    imgContainer.style.display = "flex";
     manualBtn.style.display = "none";
     errPlaceholder.style.display = "none";
     resultGrid.innerHTML = "";
-    resultGrid.className = "result-grid";
+    resultGrid.className = "result-grid classic-legacy-result-grid";
     bar.style.display = "block";
     fill.style.width = "0%";
     statusText.innerText = "Initializing Unified Tasks...";
@@ -1853,11 +2769,6 @@
     loadedImageCount = 0;
     startFakeProgress();
 
-    let finalPrompt = promptBaseText;
-    if (size === "4K") {
-      finalPrompt += ", (best quality, 4k resolution, ultra detailed, masterpiece)";
-    }
-
     let submitRefImages = refImages.slice();
     let submitReferenceIndices = [];
     if (tagState?.hasAnyTag && PromptTagsUtil) {
@@ -1868,37 +2779,202 @@
       }
     }
 
-    const requestModel = selectedModel.requestModel || selectedModel.id;
+    const requestModel = getClassicRequestModelForSize(selectedModel, selectedRoute, size);
+    const normalizedRequestSize = String(size || "1K").trim().toLowerCase();
+    const promptWithoutAr = stripAspectRatioSuffix(promptBaseText);
+    const gptImage2Model = isGptImage2Model(selectedModel, requestModel);
+    const currentPrompt = gptImage2Model ? promptWithoutAr : `${promptWithoutAr} --ar ${ratio}`.trim();
+
+    if (submitReferenceIndices.length > 0) {
+      submitReferenceIndices = submitReferenceIndices.slice();
+    }
+
+    const normalizedRefImages = submitRefImages
+      .map((imgData) => String(imgData || "").trim())
+      .filter((imgData) => imgData.length > 0);
+    const rawBase64Images = normalizedRefImages.map((imgData) =>
+      imgData.includes(",") ? imgData.split(",")[1] : imgData,
+    );
+
+    const modelLabel = selectedModel.label || selectedModel.name || selectedModel.id || requestModel;
+    const routeLabel =
+      typeof getClassicLineLabel === "function"
+        ? getClassicLineLabel(selectedRoute.line, selectedRoute.label)
+        : selectedRoute.label || selectedRoute.name || selectedRoute.id || "";
+    const releaseSubmitButton = () => {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = "INITIATE // 开始生产";
+      }
+      if (statusText && activeTasksCount > 0) {
+        statusText.innerText = "任务已提交，可继续创作下一组";
+        statusText.style.color = "var(--banana)";
+      }
+    };
+    const createSubmitSettledTracker = (total) => {
+      const expectedTotal = Math.max(1, Number(total || 1));
+      let settledCount = 0;
+      let released = false;
+      return () => {
+        settledCount += 1;
+        if (!released && settledCount >= expectedTotal) {
+          released = true;
+          releaseSubmitButton();
+        }
+      };
+    };
+    const createLiveTask = (taskIndex) => {
+      if (typeof window.createClassicLiveTask !== "function") return "";
+      return window.createClassicLiveTask({
+        prompt: promptBaseText,
+        modelLabel,
+        routeLabel,
+        size,
+        ratio,
+        index: taskIndex,
+        quantity: batchSize,
+        referenceCount: normalizedRefImages.length,
+        status: "submitting",
+      });
+    };
+
+    if (isGeminiNativeSyncRoute(selectedRoute)) {
+      const markSubmitSettled = createSubmitSettledTracker(1);
+      const liveTaskIds = Array.from({ length: batchSize }, (_, taskIndex) =>
+        createLiveTask(taskIndex + 1),
+      ).filter(Boolean);
+      submitSingleTask(
+        buildClassicGeminiPayload({
+          selectedModel,
+          selectedRoute,
+          prompt: currentPrompt,
+          ratio,
+          size,
+          quantity: batchSize,
+          referenceImages: normalizedRefImages,
+        }),
+        key,
+        size,
+        1,
+        {
+          route: selectedRoute,
+          modelId: selectedModel.id,
+          model: requestModel,
+          runToken,
+          trackUi: true,
+          endpoint: "/api/gemini/generate",
+          expectedCount: batchSize,
+          liveTaskIds,
+          promptSnapshot: promptBaseText,
+          modelLabel,
+          routeLabel,
+          onSubmitSettled: markSubmitSettled,
+        },
+      );
+      return;
+    }
+
+    if (gptImage2Model) {
+      const markSubmitSettled = createSubmitSettledTracker(batchSize);
+      for (let i = 0; i < batchSize; i += 1) {
+        const liveTaskId = createLiveTask(i + 1);
+        setTimeout(() => {
+          const payload = buildClassicGptPayload({
+            selectedModel,
+            selectedRoute,
+            requestModel,
+            prompt: currentPrompt,
+            size,
+            ratio,
+            n: 1,
+          });
+          if (submitReferenceIndices.length > 0) {
+            payload.reference_indices = submitReferenceIndices.slice();
+          }
+          if (normalizedRefImages.length > 0) {
+            payload.images = normalizedRefImages.slice();
+          }
+          submitSingleTask(payload, key, size, i + 1, {
+            route: selectedRoute,
+            modelId: selectedModel.id,
+            model: requestModel,
+            runToken,
+            trackUi: true,
+            endpoint: normalizedRefImages.length > 0 ? "/api/edit" : CONFIG.submitUrl,
+            expectedCount: 1,
+            liveTaskId,
+            liveTaskIds: liveTaskId ? [liveTaskId] : [],
+            promptSnapshot: promptBaseText,
+            modelLabel,
+            routeLabel,
+            onSubmitSettled: markSubmitSettled,
+          });
+        }, i * 180);
+      }
+      return;
+    }
+
+    const promptForRequest = getGrokPrompt(currentPrompt, ratio, size, requestModel);
     const payloadBase = {
       modelId: selectedModel.id,
       routeId: selectedRoute.id,
       uiMode: "classic",
       model: requestModel,
-      prompt: finalPrompt,
-      size,
-      image_size: size,
+      prompt: promptForRequest,
+      size: normalizedRequestSize,
       aspect_ratio: ratio,
       n: 1,
     };
-
     if (submitReferenceIndices.length > 0) {
       payloadBase.reference_indices = submitReferenceIndices.slice();
     }
-
-    if (submitRefImages.length > 0) {
-      const normalizedRefImages = submitRefImages
-        .map((imgData) => String(imgData || "").trim())
-        .filter((imgData) => imgData.length > 0);
-      const rawBase64Images = normalizedRefImages.map((imgData) =>
-        imgData.includes(",") ? imgData.split(",")[1] : imgData,
-      );
-      const useDataUriReferences = selectedRoute?.requiresDataUriReferences === true;
-      const finalRefImages = useDataUriReferences ? normalizedRefImages : rawBase64Images;
-      payloadBase.image = finalRefImages;
-      payloadBase.images = finalRefImages;
+    if (normalizedRefImages.length > 0) {
+      const isDoubaoModel = String(selectedModel?.sizeBehavior || "").startsWith("doubao");
+      const isGrokModel = String(requestModel || "").startsWith("grok-");
+      if (isDoubaoModel) {
+        payloadBase.image = rawBase64Images.slice();
+      } else if (isGrokModel) {
+        const grokRefMode =
+          typeof getGrokRefMode === "function" ? getGrokRefMode() : "stable_fusion";
+        const rawPrimaryImage = rawBase64Images[0];
+        const isMultiRef = rawBase64Images.length > 1;
+        payloadBase.reference_mode = grokRefMode;
+        payloadBase.image =
+          grokRefMode === "classic_multi" && isMultiRef
+            ? rawBase64Images.slice()
+            : rawPrimaryImage;
+        payloadBase.images = rawBase64Images.slice();
+        payloadBase.reference_image = rawPrimaryImage;
+        payloadBase.reference_images = rawBase64Images.slice();
+      } else {
+        let collageBase64 = "";
+        try {
+          collageBase64 = await createClassicCollageFromSrcs(normalizedRefImages);
+        } catch (error) {
+          console.error("[Classic Bridge] create reference collage failed:", error);
+          activeTasksCount = 0;
+          clearInterval(progressInterval);
+          if (bar) bar.style.display = "none";
+          if (statusText) {
+            statusText.innerText = "参考图处理失败，请重新上传后再试";
+            statusText.style.color = "#FFD60A";
+          }
+          releaseSubmitButton();
+          return;
+        }
+        const collageRaw = collageBase64.includes(",") ? collageBase64.split(",")[1] : collageBase64;
+        payloadBase.prompt =
+          normalizedRefImages.length > 1
+            ? `[多图参考] 输入是 ${normalizedRefImages.length} 张图片的拼贴。${currentPrompt}`
+            : currentPrompt;
+        payloadBase.image = collageRaw;
+        payloadBase.images = [collageRaw];
+      }
     }
 
+    const markSubmitSettled = createSubmitSettledTracker(batchSize);
     for (let i = 0; i < batchSize; i += 1) {
+      const liveTaskId = createLiveTask(i + 1);
       setTimeout(() => {
         submitSingleTask(
           {
@@ -1914,6 +2990,12 @@
             model: requestModel,
             runToken,
             trackUi: true,
+            liveTaskId,
+            liveTaskIds: liveTaskId ? [liveTaskId] : [],
+            promptSnapshot: promptBaseText,
+            modelLabel,
+            routeLabel,
+            onSubmitSettled: markSubmitSettled,
           },
         );
       }, i * 180);
@@ -1980,7 +3062,12 @@
       void refreshClassicSession(false);
     });
 
-    await Promise.allSettled([loadRegistrationStatus(), loadClassicCatalogs(), refreshClassicSession(false)]);
+    await Promise.allSettled([
+      loadRegistrationStatus(),
+      loadClassicCatalogs(),
+      loadClassicPromptToolConfig(),
+      refreshClassicSession(false),
+    ]);
     renderAuthState();
     renderCatalogUi();
     updateApiGuidePrompt();

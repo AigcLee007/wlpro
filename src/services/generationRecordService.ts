@@ -1,8 +1,8 @@
-import { ensureBillingIdentity, getAuthorizedBillingHeaders } from './accountIdentity';
+﻿import { ensureBillingIdentity, getAuthorizedBillingHeaders } from './accountIdentity';
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -62,21 +62,33 @@ const parseResponse = async <T>(response: Response): Promise<T> => {
 export const fetchGenerationRecords = async ({
   mediaType = 'all',
   status = 'all',
+  uiMode = 'all',
+  days = 5,
   page = 1,
   pageSize = 50,
+  sinceCreatedAt,
+  sinceId,
 }: {
   mediaType?: 'all' | 'image' | 'video';
   status?: 'all' | 'pending' | 'success' | 'failed';
+  uiMode?: 'all' | GenerationRecordUiMode;
+  days?: number;
   page?: number;
   pageSize?: number;
+  sinceCreatedAt?: string;
+  sinceId?: string;
 } = {}): Promise<GenerationRecordListPayload> => {
   await ensureBillingIdentity();
 
   const params = new URLSearchParams();
   params.set('mediaType', mediaType);
   params.set('status', status);
+  params.set('uiMode', uiMode);
+  params.set('days', String(days));
   params.set('page', String(page));
   params.set('pageSize', String(pageSize));
+  if (sinceCreatedAt) params.set('sinceCreatedAt', String(sinceCreatedAt));
+  if (sinceId) params.set('sinceId', String(sinceId));
 
   const response = await fetch(
     `${cleanUrl(API_BASE_URL)}/generation-records?${params.toString()}`,
@@ -94,13 +106,16 @@ export const fetchGenerationRecords = async ({
 
 export const clearGenerationRecords = async ({
   mediaType = 'all',
+  uiMode = 'all',
 }: {
   mediaType?: 'all' | 'image' | 'video';
+  uiMode?: 'all' | GenerationRecordUiMode;
 } = {}): Promise<{ success: boolean; removed: number }> => {
   await ensureBillingIdentity();
 
   const params = new URLSearchParams();
   params.set('mediaType', mediaType);
+  params.set('uiMode', uiMode);
 
   const response = await fetch(
     `${cleanUrl(API_BASE_URL)}/generation-records?${params.toString()}`,
@@ -115,3 +130,4 @@ export const clearGenerationRecords = async ({
 
   return parseResponse<{ success: boolean; removed: number }>(response);
 };
+

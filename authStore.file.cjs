@@ -58,6 +58,7 @@ const normalizeUser = (user = {}, emailFallback = "") => {
     userId: String(user.userId || buildUserId()).trim(),
     email,
     displayName: normalizeDisplayName(user.displayName) || toDisplayNameFallback(email),
+    adminNote: String(user.adminNote || "").trim(),
     passwordHash: String(user.passwordHash || "").trim() || null,
     role,
     status: normalizeStatus(user.status, "active"),
@@ -160,9 +161,9 @@ const withStore = (mutator) => {
   return result;
 };
 
-const toPublicUser = (user) => {
+const toPublicUser = (user, { includeAdminNote = false } = {}) => {
   const role = getEffectiveRole(user);
-  return {
+  const publicUser = {
     userId: user.userId,
     email: normalizeEmail(user.email),
     displayName:
@@ -176,6 +177,10 @@ const toPublicUser = (user) => {
     updatedAt: user.updatedAt,
     lastLoginAt: user.lastLoginAt || null,
   };
+  if (includeAdminNote) {
+    publicUser.adminNote = String(user.adminNote || "").trim();
+  }
+  return publicUser;
 };
 
 const createSession = (userId) => {
@@ -231,7 +236,7 @@ const describeEmailCodePurpose = (purpose = "login") => {
 const sendEmailCode = async (email, code, { purpose = "login" } = {}) => {
   const transporter = createTransporter();
   const from = String(process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
-const appName = String(process.env.APP_NAME || "武陵商厦").trim();
+  const appName = String(process.env.APP_NAME || "武陵商厦创作平台").trim();
   const purposeMeta = describeEmailCodePurpose(purpose);
 
   if (!transporter || !from) {
@@ -753,14 +758,41 @@ const requireAdminAccess = (req, fallbackApiKeys = []) => {
   throw new AuthError("ADMIN_REQUIRED", "Administrator access is required");
 };
 
-const listAdminUsers = ({ search = "", page = 1, pageSize = 20 } = {}) => {
+const listAdminUsers = ({ search = "", page = 1, pageSize = 20, includeAdminNote = false } = {}) => {
   const trimmedSearch = String(search || "").trim().toLowerCase();
   const safePage = Math.max(1, Number.parseInt(String(page || 1), 10) || 1);
   const safePageSize = Math.min(100, Math.max(1, Number.parseInt(String(pageSize || 20), 10) || 20));
+  const safeOnlineWindowMinutes = 5;
 
   const store = readStore();
+  cleanupStore(store);
+  const nowMs = Date.now();
+  const onlineCutoffMs = nowMs - safeOnlineWindowMinutes * 60 * 1000;
+  const onlineStateMap = new Map();
+  for (const session of Object.values(store.sessions || {})) {
+    const expiresAtMs = Date.parse(String(session?.expiresAt || ""));
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) continue;
+    const lastSeenAt = String(session?.lastSeenAt || "").trim();
+    const lastSeenAtMs = lastSeenAt ? Date.parse(lastSeenAt) : NaN;
+    if (!Number.isFinite(lastSeenAtMs) || lastSeenAtMs < onlineCutoffMs) continue;
+    const userId = String(session?.userId || "").trim();
+    if (!userId) continue;
+    const existing = onlineStateMap.get(userId);
+    if (!existing || Date.parse(existing) < lastSeenAtMs) {
+      onlineStateMap.set(userId, lastSeenAt);
+    }
+  }
+
   const users = Object.values(store.users)
-    .map((user) => toPublicUser(user))
+    .map((user) => {
+      const publicUser = toPublicUser(user, { includeAdminNote });
+      const lastSeenAt = onlineStateMap.get(publicUser.userId) || null;
+      return {
+        ...publicUser,
+        isOnline: Boolean(lastSeenAt),
+        lastSeenAt,
+      };
+    })
     .filter((user) => {
       if (!trimmedSearch) return true;
       return [user.email, user.displayName, user.userId]
@@ -777,11 +809,23 @@ const listAdminUsers = ({ search = "", page = 1, pageSize = 20 } = {}) => {
 
   const total = users.length;
   const offset = (safePage - 1) * safePageSize;
+  const onlineUsers = users
+    .filter((user) => user.isOnline)
+    .sort((left, right) => {
+      const leftSeen = Date.parse(String(left.lastSeenAt || ""));
+      const rightSeen = Date.parse(String(right.lastSeenAt || ""));
+      if (leftSeen !== rightSeen) return rightSeen - leftSeen;
+      return String(left.displayName || left.email).localeCompare(String(right.displayName || right.email));
+    })
+    .slice(0, 50);
   return {
     total,
     page: safePage,
     pageSize: safePageSize,
     totalPages: Math.max(1, Math.ceil(total / safePageSize)),
+    onlineTotal: onlineUsers.length,
+    onlineWindowMinutes: safeOnlineWindowMinutes,
+    onlineUsers,
     users: users.slice(offset, offset + safePageSize),
   };
 };
@@ -873,12 +917,12 @@ const getAdminAuthOverview = ({
   };
 };
 
-const getAdminUserById = (userId) => {
+const getAdminUserById = (userId, { includeAdminNote = false } = {}) => {
   const targetUserId = String(userId || "").trim();
   if (!targetUserId) return null;
   const store = readStore();
   const user = store.users[targetUserId];
-  return user ? toPublicUser(user) : null;
+  return user ? toPublicUser(user, { includeAdminNote }) : null;
 };
 
 const updateAdminUser = (actor, userId, changes = {}) => {
@@ -909,6 +953,10 @@ const updateAdminUser = (actor, userId, changes = {}) => {
       Object.prototype.hasOwnProperty.call(changes, "status")
         ? normalizeStatus(changes.status, normalizeStatus(user.status, "active"))
         : normalizeStatus(user.status, "active");
+    const nextAdminNote =
+      Object.prototype.hasOwnProperty.call(changes, "adminNote")
+        ? String(changes.adminNote || "").trim().slice(0, 2000)
+        : String(user.adminNote || "").trim();
 
     const targetWasSuperAdmin = normalizeRole(user.role, "user") === "super_admin";
     const targetWillRemainSuperAdmin = nextRole === "super_admin" && nextStatus === "active";
@@ -939,6 +987,7 @@ const updateAdminUser = (actor, userId, changes = {}) => {
     user.displayName = nextDisplayName;
     user.role = nextRole;
     user.status = nextStatus;
+    user.adminNote = nextAdminNote;
     user.updatedAt = new Date().toISOString();
 
     if (nextStatus !== "active") {
@@ -949,86 +998,7 @@ const updateAdminUser = (actor, userId, changes = {}) => {
       });
     }
 
-    return toPublicUser(user);
-  });
-};
-
-const assertAdminCanManageRegularUser = (actor, targetUser) => {
-  if (!hasAdminRole(actor?.role)) {
-    throw new AuthError("ADMIN_REQUIRED", "Administrator access is required");
-  }
-
-  const targetRole = normalizeRole(targetUser?.role, "user");
-  if (targetRole !== "user") {
-    throw new AuthError(
-      "ADMIN_TARGET_RESTRICTED",
-      "Administrators can only manage regular users",
-    );
-  }
-};
-
-const resetAdminManagedUserPassword = (actor, userId, nextPassword = "1234567890") => {
-  const targetUserId = String(userId || "").trim();
-  if (!targetUserId) {
-    throw new AuthError("USER_NOT_FOUND", "User does not exist");
-  }
-
-  const normalizedPassword = String(nextPassword || "").trim();
-  validatePassword(normalizedPassword);
-
-  return withStore((store) => {
-    const user = store.users[targetUserId];
-    if (!user) {
-      throw new AuthError("USER_NOT_FOUND", "User does not exist");
-    }
-
-    assertAdminCanManageRegularUser(actor, user);
-
-    user.passwordHash = hashPassword(normalizedPassword);
-    user.passwordUpdatedAt = new Date().toISOString();
-    user.updatedAt = user.passwordUpdatedAt;
-
-    Object.keys(store.sessions).forEach((token) => {
-      if (store.sessions[token]?.userId === targetUserId) {
-        delete store.sessions[token];
-      }
-    });
-
-    return toPublicUser(user);
-  });
-};
-
-const setAdminManagedUserStatus = (actor, userId, status) => {
-  const targetUserId = String(userId || "").trim();
-  if (!targetUserId) {
-    throw new AuthError("USER_NOT_FOUND", "User does not exist");
-  }
-
-  return withStore((store) => {
-    const user = store.users[targetUserId];
-    if (!user) {
-      throw new AuthError("USER_NOT_FOUND", "User does not exist");
-    }
-
-    assertAdminCanManageRegularUser(actor, user);
-
-    const nextStatus = normalizeStatus(status, normalizeStatus(user.status, "active"));
-    if (!["active", "disabled"].includes(nextStatus)) {
-      throw new AuthError("INVALID_USER_STATUS", "Unsupported user status");
-    }
-
-    user.status = nextStatus;
-    user.updatedAt = new Date().toISOString();
-
-    if (nextStatus !== "active") {
-      Object.keys(store.sessions).forEach((token) => {
-        if (store.sessions[token]?.userId === targetUserId) {
-          delete store.sessions[token];
-        }
-      });
-    }
-
-    return toPublicUser(user);
+    return toPublicUser(user, { includeAdminNote: true });
   });
 };
 
@@ -1047,11 +1017,9 @@ module.exports = {
   registerWithPassword,
   resetPasswordWithEmailCode,
   requestEmailCode,
-  resetAdminManagedUserPassword,
   requireAdminAccess,
   requireAuthUser,
   requireSuperAdminAccess,
-  setAdminManagedUserStatus,
   setUserPassword,
   toPublicUser,
   updateAdminUser,

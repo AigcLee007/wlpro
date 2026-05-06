@@ -3,9 +3,9 @@ import { useQueries } from '@tanstack/react-query';
 import { checkTaskStatus, checkVideoTaskStatus, findAllUrlsInObject } from '../services/api';
 import { useToast } from '../context/ToastContext';
 import { useCanvasStore } from '../store/canvasStore';
-
-const USER_FACING_GENERATION_ERROR_MESSAGE =
-  '请检查提示词或参考图，可能触发了安全限制，请更换后重试';
+import {
+  extractErrorMessage,
+} from '../utils/errorDebug';
 
 export const useGlobalPolling = (
   apiKey: string | undefined,
@@ -33,6 +33,7 @@ export const useGlobalPolling = (
       queryKey: ['task', node.taskId],
       queryFn: async () => {
         if (!node.taskId) return null;
+        if (node.type === 'VIDEO' && !apiKey) return null;
 
         const data =
           node.type === 'VIDEO'
@@ -81,15 +82,35 @@ export const useGlobalPolling = (
         return 5000;
       },
       retry: 3,
-      enabled: !!node.taskId,
+      enabled: !!node.taskId && (node.type === 'IMAGE' || !!apiKey),
     })),
   });
 
   const processedTasksRef = useRef<Map<string, { success: boolean; failed: boolean }>>(new Map());
 
   useEffect(() => {
-    queries.forEach((result) => {
+    queries.forEach((result, index) => {
       const data = result.data;
+      const taskNode = pendingTasks[index];
+      const fallbackTaskId = taskNode?.taskId || '';
+
+      if (result.error && fallbackTaskId) {
+        const targetNodes = pendingNodes.filter((n) => n.taskId === fallbackTaskId);
+        targetNodes.forEach((node) => {
+          const processedKey = `${fallbackTaskId}:${node.id}`;
+          const processedState = processedTasksRef.current.get(processedKey) || {
+            success: false,
+            failed: false,
+          };
+          if (processedState.failed) return;
+          processedTasksRef.current.set(processedKey, { ...processedState, failed: true });
+          const nextError = extractErrorMessage(result.error) || '任务查询失败，未返回错误详情';
+          onUpdateGeneration(node.id, null, nextError);
+          toastError(nextError);
+        });
+        return;
+      }
+
       if (!data || !data.taskId) return;
 
       const targetNodes = pendingNodes.filter((n) => n.taskId === data.taskId);
@@ -120,8 +141,10 @@ export const useGlobalPolling = (
 
         if (data.isFailed && !processedState.failed) {
           processedTasksRef.current.set(processedKey, { ...processedState, failed: true });
-          onUpdateGeneration(node.id, null, USER_FACING_GENERATION_ERROR_MESSAGE);
-          toastError(USER_FACING_GENERATION_ERROR_MESSAGE);
+          const rawDetails = data.raw?.details || data.raw?.error || data.raw?.message || data.raw;
+          const nextError = extractErrorMessage(rawDetails) || '任务失败，未返回错误详情';
+          onUpdateGeneration(node.id, null, nextError);
+          toastError(nextError);
         }
       });
     });
@@ -132,9 +155,10 @@ export const useGlobalPolling = (
     }
   }, [
     pendingNodes,
+    pendingTasks,
     queries.map((q) => `${q.data?.taskId ?? ''}:${q.data?.status ?? ''}`).join('|'),
+    queries.map((q) => `${q.error ? 'E' : 'O'}:${q.error ? extractErrorMessage(q.error) : ''}`).join('|'),
     onUpdateGeneration,
     toastError,
   ]);
 };
-

@@ -1,107 +1,30 @@
-﻿import axios from 'axios';
-
-import {
-  buildBillingIdentityHeaders,
-  getStoredAuthSessionToken,
-} from './accountIdentity';
+import axios from 'axios';
+import { getAuthorizedBillingHeaders } from './accountIdentity';
 
 const API_BASE_URL = '/api';
 
-const buildOptionalSessionHeaders = (): Record<string, string> => {
-  const sessionToken = getStoredAuthSessionToken();
-  return sessionToken ? buildBillingIdentityHeaders(sessionToken) : {};
-};
+const sanitizeHeader = (value: string) => value.replace(/[^\x00-\x7F]/g, '').trim();
 
-const buildVideoRequestHeaders = (apiKey: string): Record<string, string> => {
-  const headers: Record<string, string> = {
-    ...buildOptionalSessionHeaders(),
-  };
-  const normalizedKey = String(apiKey || '').trim();
-  if (normalizedKey) {
-    headers.Authorization = normalizedKey;
-  }
-  return headers;
-};
+const buildAuthHeaders = (apiKey?: string | null): Record<string, string> => {
+  const trimmed = String(apiKey || '').trim();
+  if (!trimmed) return {};
 
-export const normalizeVideoDeliveryUrl = (value: string): string => {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  if (/^\/api\/proxy\/video\?/i.test(raw)) return raw;
-  if (/^https:\/\//i.test(raw)) return raw;
-  if (
-    typeof window !== 'undefined' &&
-    window.location.protocol === 'https:' &&
-    /^http:\/\//i.test(raw)
-  ) {
-    return `/api/proxy/video?url=${encodeURIComponent(raw)}`;
-  }
-  return raw;
-};
-
-export const looksLikeVideoUrl = (value: string): boolean => {
-  const raw = String(value || '').trim().toLowerCase();
-  if (!raw) return false;
-  return (
-    raw.endsWith('.mp4') ||
-    raw.includes('format=mp4') ||
-    raw.includes('/video/') ||
-    raw.includes('/api/proxy/video?') ||
-    raw.includes('mime=video') ||
-    raw.includes('video/mp4')
+  const authorization = sanitizeHeader(
+    trimmed.startsWith('Bearer ') ? trimmed : `Bearer ${trimmed}`,
   );
+  return authorization ? { Authorization: authorization } : {};
 };
 
-const extractVideoOutputUrl = (payload: any): string => {
-  if (!payload || typeof payload !== 'object') return '';
-  const direct =
-    payload.video_url ||
-    payload.image_url ||
-    payload.url ||
-    payload.uri ||
-    payload.fileUri ||
-    payload.file_uri ||
-    payload.data?.output;
-  if (typeof direct === 'string' && direct.trim()) {
-    return normalizeVideoDeliveryUrl(direct.trim());
-  }
-
-  const candidateParts = payload?.candidates?.[0]?.content?.parts;
-  if (Array.isArray(candidateParts)) {
-    for (const part of candidateParts) {
-      const fileUri =
-        part?.fileData?.fileUri ||
-        part?.fileData?.file_uri ||
-        part?.file_data?.file_uri ||
-        part?.file_data?.fileUri;
-      if (typeof fileUri === 'string' && fileUri.trim()) {
-        return normalizeVideoDeliveryUrl(fileUri.trim());
-      }
-    }
-  }
-
-  const listCandidates = [
-    payload?.results,
-    payload?.data?.results,
-    payload?.response?.results,
-    payload?.output,
-  ];
-  for (const list of listCandidates) {
-    if (Array.isArray(list)) {
-      const first = list[0];
-      const url =
-        first?.url || first?.uri || first?.fileUri || first?.file_uri || first?.video_url;
-      if (typeof url === 'string' && url.trim()) {
-        return normalizeVideoDeliveryUrl(url.trim());
-      }
-    }
-  }
-
-  return '';
-};
+const buildVideoRequestHeaders = async (
+  apiKey?: string | null,
+): Promise<Record<string, string>> => ({
+  ...(await getAuthorizedBillingHeaders()),
+  ...buildAuthHeaders(apiKey),
+});
 
 // Extracted polling function for reuse in recovery
 export const pollVideoTask = async (
-  apiKey: string,
+  apiKey: string | undefined,
   taskId: string,
   onProgress?: (progress: number) => void
 ): Promise<string> => {
@@ -121,8 +44,9 @@ export const pollVideoTask = async (
       }
 
       try {
+        const headers = await buildVideoRequestHeaders(apiKey);
         const pollRes = await axios.get(`${API_BASE_URL}/video/task/${taskId}`, {
-          headers: buildVideoRequestHeaders(apiKey),
+          headers,
         });
 
         const task = pollRes.data;
@@ -132,7 +56,7 @@ export const pollVideoTask = async (
           task?.data?.status ||
           ''
         ).toLowerCase();
-        const outputUrl = extractVideoOutputUrl(task);
+        const outputUrl = task.image_url || task.video_url || task.url || task.data?.output;
         const failReason =
           task.fail_reason ||
           task.error ||
@@ -194,7 +118,7 @@ export const pollVideoTask = async (
 };
 
 export const generateVideo = async (
-  apiKey: string,
+  apiKey: string | undefined,
   model: string,
   prompt: string,
   images: string[] | undefined,
@@ -275,37 +199,24 @@ export const generateVideo = async (
         payload.duration = parseInt(options.duration, 10);
       }
       if (images && images.length > 0) {
-        payload.images = images;
+        payload.images = [images[0]];
       }
     } else {
       Object.assign(payload, options);
       if (images && images.length > 0) {
-      payload.image = images[0];
+        payload.image = images[0];
       }
     }
 
-    const sessionToken = getStoredAuthSessionToken();
-    if (sessionToken) {
-      payload.authSessionToken = sessionToken;
-    }
-
+    const headers = await buildVideoRequestHeaders(apiKey);
     const response = await axios.post(`${API_BASE_URL}/video/generate`, payload, {
-      headers: buildVideoRequestHeaders(apiKey),
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
+      },
     });
 
-    const immediateOutputUrl = extractVideoOutputUrl(response?.data);
-    if (immediateOutputUrl) {
-      return immediateOutputUrl;
-    }
-
-    const taskId =
-      response?.data?.id ||
-      response?.data?.task_id ||
-      response?.data?.data?.task_id ||
-      response?.data?.name ||
-      response?.data?.operation?.name ||
-      response?.data?.data?.name ||
-      response?.data?.responseId;
+    const taskId = response?.data?.id || response?.data?.task_id || response?.data?.data?.task_id;
 
     if (!taskId) {
       throw new Error('未返回任务ID');

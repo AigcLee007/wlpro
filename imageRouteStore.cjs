@@ -130,6 +130,14 @@ const buildStaticRows = () =>
     ? staticCatalog.routes.map((route, index) => normalizeStaticRoute(route, index))
     : [];
 
+const getStaticRouteDefaults = (routeId) =>
+  buildStaticRows().find((row) => trimToString(row.route_id) === trimToString(routeId)) || null;
+
+const getMergedSizeOverrides = (row) => ({
+  ...normalizeSizeOverrides(getStaticRouteDefaults(row.route_id)?.size_overrides),
+  ...normalizeSizeOverrides(row.size_overrides),
+});
+
 const mapRowToRoute = (row, { includeSecrets = false } = {}) => ({
   id: trimToString(row.route_id),
   label: trimToString(row.label || row.route_id),
@@ -148,7 +156,7 @@ const mapRowToRoute = (row, { includeSecrets = false } = {}) => ({
   allowUserApiKeyWithoutLogin: parseBoolean(row.allow_user_api_key_without_login, false),
   apiKeyEnv: trimToString(row.api_key_env || ""),
   pointCost: parsePoint(row.point_cost, 0),
-  sizeOverrides: normalizeSizeOverrides(row.size_overrides),
+  sizeOverrides: getMergedSizeOverrides(row),
   sortOrder: parseInteger(row.sort_order, 0),
   isActive: parseBoolean(row.is_active, true),
   isDefaultRoute: parseBoolean(row.is_default_route, false),
@@ -282,17 +290,130 @@ const ensureImageRouteSchema = async () => {
             AND LOWER(base_url) LIKE '%api.bltcy.ai%'
         `,
       );
+      const nowDb = toDbDateTime();
+      const line1StaticRoute = getStaticRouteDefaults("gpt-image-2-default");
+      if (line1StaticRoute) {
+        await pool.execute(
+          `
+            UPDATE image_routes
+            SET label = ?,
+                description = ?,
+                line_value = ?,
+                point_cost = ?,
+                size_overrides = ?,
+                sort_order = ?,
+                is_active = 1,
+                is_default_route = 0,
+                updated_at = ?
+            WHERE route_id = ?
+          `,
+          [
+            line1StaticRoute.label,
+            line1StaticRoute.description,
+            line1StaticRoute.line_value,
+            line1StaticRoute.point_cost,
+            line1StaticRoute.size_overrides,
+            line1StaticRoute.sort_order,
+            nowDb,
+            line1StaticRoute.route_id,
+          ],
+        );
+      }
+      const line2StaticRoute = getStaticRouteDefaults("gpt-image-2-line2");
+      if (line2StaticRoute) {
+        await pool.execute(
+          `
+            UPDATE image_routes
+            SET label = ?,
+                description = ?,
+                line_value = ?,
+                transport = ?,
+                mode = ?,
+                base_url = ?,
+                generate_path = ?,
+                task_path = ?,
+                edit_path = ?,
+                use_request_model = ?,
+                allow_user_api_key_without_login = ?,
+                api_key_env = ?,
+                point_cost = ?,
+                size_overrides = ?,
+                sort_order = ?,
+                is_active = 1,
+                is_default_route = 0,
+                updated_at = ?
+            WHERE route_id = ?
+          `,
+          [
+            line2StaticRoute.label,
+            line2StaticRoute.description,
+            line2StaticRoute.line_value,
+            line2StaticRoute.transport,
+            line2StaticRoute.mode,
+            line2StaticRoute.base_url,
+            line2StaticRoute.generate_path,
+            line2StaticRoute.task_path,
+            line2StaticRoute.edit_path,
+            line2StaticRoute.use_request_model ? 1 : 0,
+            line2StaticRoute.allow_user_api_key_without_login ? 1 : 0,
+            line2StaticRoute.api_key_env,
+            line2StaticRoute.point_cost,
+            line2StaticRoute.size_overrides,
+            line2StaticRoute.sort_order,
+            nowDb,
+            line2StaticRoute.route_id,
+          ],
+        );
+      }
+      await pool.execute(
+        `
+          UPDATE image_routes
+          SET is_active = 0,
+              is_default_route = 0,
+              updated_at = ?
+          WHERE model_family = 'gpt-image-2'
+            AND route_id NOT IN ('gpt-image-2-default', 'gpt-image-2-line2')
+        `,
+        [nowDb],
+      );
 
       await withTransaction(async (connection) => {
         const [countRows] = await connection.execute(
           "SELECT COUNT(*) AS total FROM image_routes",
         );
-        if (Number(countRows?.[0]?.total || 0) > 0) {
-          return;
-        }
+        const hasExistingRoutes = Number(countRows?.[0]?.total || 0) > 0;
+        const [existingRows] = hasExistingRoutes
+          ? await connection.execute(
+              "SELECT route_id, model_family, line_value FROM image_routes",
+            )
+          : [[]];
+        const existingRouteIds = new Set(
+          (Array.isArray(existingRows) ? existingRows : []).map((row) =>
+            trimToString(row.route_id),
+          ),
+        );
+        const existingFamilyLines = new Set(
+          (Array.isArray(existingRows) ? existingRows : []).map(
+            (row) => `${trimToString(row.model_family)}\u0000${trimToString(row.line_value)}`,
+          ),
+        );
 
-        const nowDb = toDbDateTime();
-        const rows = buildStaticRows();
+        const rows = buildStaticRows().filter(
+          (row) => {
+            if (!hasExistingRoutes) return true;
+            const routeId = trimToString(row.route_id);
+            if (existingRouteIds.has(routeId)) return false;
+            if (
+              row.model_family === "gpt-image-2" &&
+              ["gpt-image-2-default", "gpt-image-2-line2"].includes(routeId)
+            ) {
+              return true;
+            }
+            return !existingFamilyLines.has(
+              `${trimToString(row.model_family)}\u0000${trimToString(row.line_value)}`,
+            );
+          },
+        );
         for (const row of rows) {
           await connection.execute(
             `
@@ -592,9 +713,6 @@ const validateResolvedRouteConfig = (payload) => {
   }
 
   if (transport === "gemini-native") {
-    if (mode !== "sync") {
-      throw new Error("Gemini native routes currently support sync mode only");
-    }
     if (!hasModelPlaceholder) {
       throw new Error("Gemini native routes must include {model} in generatePath");
     }
@@ -803,13 +921,6 @@ const deleteManagedImageRoute = async (routeId) => {
     }
 
     const family = trimToString(existing.model_family || "");
-    const [remainingCountRows] = await connection.execute(
-      "SELECT COUNT(*) AS total FROM image_routes WHERE model_family = ? AND route_id <> ?",
-      [family, routeIdValue],
-    );
-    if (Number(remainingCountRows?.[0]?.total || 0) <= 0) {
-      throw new Error("Each route family must retain at least one route");
-    }
 
     const deletingDefaultRoute = parseBoolean(existing.is_default_route, false);
     const deletingDefaultNanoLine = parseBoolean(existing.is_default_nano_banana_line, false);

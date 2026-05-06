@@ -1,4 +1,4 @@
-import {
+﻿import {
   buildBillingIdentityHeaders,
   getAuthorizedBillingHeaders,
   getStoredAuthSessionToken,
@@ -7,31 +7,19 @@ import {
   allowsDirectUserApiKeyImageRoute,
   getImageRouteById,
 } from '../src/config/imageRoutes';
+import {
+  AppError,
+  DEFAULT_ERROR_MESSAGE,
+  extractErrorMessage,
+} from '../src/utils/errorDebug';
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
-
-const USER_FACING_GENERATION_ERROR_MESSAGE =
-  '请检查提示词或参考图，可能触发了安全限制，请更换后重试';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 const sanitizeHeader = (value: string) => value.replace(/[^\x00-\x7F]/g, '').trim();
-const normalizeVideoResultUrl = (value: string) => {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  if (/^\/api\/proxy\/video\?/i.test(raw)) return raw;
-  if (/^https:\/\//i.test(raw)) return raw;
-  if (
-    typeof window !== 'undefined' &&
-    window.location.protocol === 'https:' &&
-    /^http:\/\//i.test(raw)
-  ) {
-    return `/api/proxy/video?url=${encodeURIComponent(raw)}`;
-  }
-  return raw;
-};
 
 const buildAuthHeaders = (apiKey?: string | null): Record<string, string> => {
   const trimmed = String(apiKey || '').trim();
@@ -73,14 +61,20 @@ const buildImageRequestHeaders = async (
   };
 };
 
-const handleApiError = async (response: Response, fallbackMessage: string) => {
-  const rawText = await response.text();
+const parseErrorResponse = async (response: Response) => {
+  const rawText = await response.text().catch(() => '');
   let errJson: any = null;
   try {
-    errJson = JSON.parse(rawText);
+    errJson = rawText ? JSON.parse(rawText) : null;
   } catch (_) {
     errJson = null;
   }
+
+  return { rawText, errJson };
+};
+
+const handleApiError = async (response: Response, fallbackMessage: string) => {
+  const { rawText, errJson } = await parseErrorResponse(response);
 
   console.error('[Generation API] request failed', {
     status: response.status,
@@ -90,7 +84,29 @@ const handleApiError = async (response: Response, fallbackMessage: string) => {
     code: errJson?.code || null,
   });
 
-  throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+  throw new AppError(
+    extractErrorMessage(errJson) || rawText.trim() || fallbackMessage || DEFAULT_ERROR_MESSAGE,
+    {
+      code: String(errJson?.code || '').trim() || undefined,
+      status: Number(errJson?.status || response.status),
+      traceId: String(errJson?.traceId || '').trim() || undefined,
+      details: String(errJson?.details || '').trim() || undefined,
+    },
+  );
+};
+
+const throwPollingError = async (response: Response) => {
+  const { rawText, errJson } = await parseErrorResponse(response);
+
+  throw new AppError(
+    extractErrorMessage(errJson) || rawText.trim() || `任务查询失败 (${response.status})`,
+    {
+      code: String(errJson?.code || '').trim() || undefined,
+      status: Number(errJson?.status || response.status),
+      traceId: String(errJson?.traceId || '').trim() || undefined,
+      details: String(errJson?.details || '').trim() || undefined,
+    },
+  );
 };
 
 export const getModelBySize = (size: string): string => {
@@ -114,6 +130,11 @@ export interface TaskStatusResponse {
   [key: string]: any;
 }
 
+const isUsableResultUrl = (value: unknown): value is string => {
+  if (typeof value !== 'string') return false;
+  return value.startsWith('http') || value.startsWith('data:') || value.startsWith('/');
+};
+
 export function findAllUrlsInObject(obj: any, results: string[] = []) {
   if (!obj) return;
 
@@ -127,45 +148,23 @@ export function findAllUrlsInObject(obj: any, results: string[] = []) {
   if (
     obj.output &&
     typeof obj.output === 'string' &&
-    (obj.output.startsWith('http') || obj.output.startsWith('data:'))
+    isUsableResultUrl(obj.output)
   ) {
-    results.push(normalizeVideoResultUrl(obj.output));
+    results.push(obj.output);
   } else if (
     obj.url &&
     typeof obj.url === 'string' &&
-    (obj.url.startsWith('http') || obj.url.startsWith('data:'))
+    isUsableResultUrl(obj.url)
   ) {
-    results.push(normalizeVideoResultUrl(obj.url));
+    results.push(obj.url);
   } else if (
     obj.image_url &&
     typeof obj.image_url === 'string' &&
-    (obj.image_url.startsWith('http') || obj.image_url.startsWith('data:'))
+    isUsableResultUrl(obj.image_url)
   ) {
-    results.push(normalizeVideoResultUrl(obj.image_url));
-  } else if (
-    obj.video_url &&
-    typeof obj.video_url === 'string' &&
-    (obj.video_url.startsWith('http') || obj.video_url.startsWith('data:') || obj.video_url.startsWith('/'))
-  ) {
-    results.push(normalizeVideoResultUrl(obj.video_url));
-  } else if (
-    obj.fileUri &&
-    typeof obj.fileUri === 'string' &&
-    (obj.fileUri.startsWith('http') || obj.fileUri.startsWith('data:') || obj.fileUri.startsWith('/'))
-  ) {
-    results.push(normalizeVideoResultUrl(obj.fileUri));
-  } else if (
-    obj.file_uri &&
-    typeof obj.file_uri === 'string' &&
-    (obj.file_uri.startsWith('http') || obj.file_uri.startsWith('data:') || obj.file_uri.startsWith('/'))
-  ) {
-    results.push(normalizeVideoResultUrl(obj.file_uri));
-  } else if (
-    obj.uri &&
-    typeof obj.uri === 'string' &&
-    (obj.uri.startsWith('http') || obj.uri.startsWith('data:') || obj.uri.startsWith('/'))
-  ) {
-    results.push(normalizeVideoResultUrl(obj.uri));
+    results.push(obj.image_url);
+  } else if (obj.b64_json && typeof obj.b64_json === 'string') {
+    results.push(`data:image/png;base64,${obj.b64_json}`);
   }
 
   Object.keys(obj).forEach((key) => {
@@ -175,6 +174,12 @@ export function findAllUrlsInObject(obj: any, results: string[] = []) {
     }
   });
 }
+
+const extractGenerateResultUrls = (payload: any): string[] => {
+  const urls: string[] = [];
+  findAllUrlsInObject(payload, urls);
+  return Array.from(new Set(urls.filter((u) => isUsableResultUrl(u))));
+};
 
 export const generateImageApi = async (
   apiKey: string | undefined,
@@ -199,22 +204,27 @@ export const generateImageApi = async (
     return { taskId: '', url: resJson.url || resJson.image_url };
   }
 
-  if (Array.isArray(resJson.results) && resJson.results.length > 0) {
-    const urls = resJson.results
-      .map((item: any) => String(item?.url || item?.image_url || '').trim())
-      .filter((item: string) => Boolean(item));
-    if (urls.length > 0) {
-      return { taskId: '', images: urls, ...resJson };
-    }
-  }
-
   if (Array.isArray(resJson.images) && resJson.images.length > 0) {
     return { taskId: '', images: resJson.images, ...resJson };
   }
 
+  const normalizedStatus = String(resJson?.status || resJson?.state || '').trim().toLowerCase();
+  const directResultUrls = extractGenerateResultUrls(resJson);
+  const isImmediateSuccess =
+    ['succeeded', 'success', 'completed'].includes(normalizedStatus) &&
+    directResultUrls.length > 0;
+  if (isImmediateSuccess) {
+    return {
+      taskId: '',
+      url: directResultUrls[0],
+      images: directResultUrls,
+      ...resJson,
+    };
+  }
+
   const taskId = resJson.id || resJson.task_id || resJson.data?.task_id;
   if (!taskId && !resJson.url) {
-    throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+    throw new AppError('未返回任务 ID，且未返回图片结果');
   }
 
   return { taskId: taskId || '', ...resJson };
@@ -223,7 +233,7 @@ export const generateImageApi = async (
 export const editImageApi = async (
   apiKey: string | undefined,
   payload: any,
-): Promise<{ taskId: string }> => {
+): Promise<{ taskId: string; url?: string; images?: string[]; data?: any[] }> => {
   const response = await fetch(`${cleanUrl(API_BASE_URL)}/edit`, {
     method: 'POST',
     headers: await buildImageRequestHeaders(apiKey, payload),
@@ -238,12 +248,34 @@ export const editImageApi = async (
   }
 
   const resJson = await response.json();
-  const taskId = resJson.id || resJson.task_id || resJson.data?.task_id;
-  if (!taskId) {
-    throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+  if (resJson.url || resJson.image_url) {
+    return { taskId: '', url: resJson.url || resJson.image_url, ...resJson };
   }
 
-  return { taskId };
+  if (Array.isArray(resJson.images) && resJson.images.length > 0) {
+    return { taskId: '', images: resJson.images, ...resJson };
+  }
+
+  const normalizedStatus = String(resJson?.status || resJson?.state || '').trim().toLowerCase();
+  const directResultUrls = extractGenerateResultUrls(resJson);
+  const isImmediateSuccess =
+    ['succeeded', 'success', 'completed'].includes(normalizedStatus) &&
+    directResultUrls.length > 0;
+  if (isImmediateSuccess) {
+    return {
+      taskId: '',
+      url: directResultUrls[0],
+      images: directResultUrls,
+      ...resJson,
+    };
+  }
+
+  const taskId = resJson.id || resJson.task_id || resJson.data?.task_id;
+  if (!taskId && directResultUrls.length === 0) {
+    throw new AppError('未返回任务 ID，且未返回图片结果');
+  }
+
+  return { taskId: taskId || '', ...resJson };
 };
 
 export const getTaskStatusApi = async (
@@ -260,7 +292,7 @@ export const getTaskStatusApi = async (
   });
 
   if (!response.ok) {
-    throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+    await throwPollingError(response);
   }
 
   return response.json();
@@ -282,7 +314,7 @@ export const checkVideoTaskStatus = async (
   });
 
   if (!response.ok) {
-    throw new Error(USER_FACING_GENERATION_ERROR_MESSAGE);
+    await throwPollingError(response);
   }
 
   return response.json();

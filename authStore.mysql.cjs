@@ -87,7 +87,7 @@ const describeEmailCodePurpose = (purpose = "login") => {
 const sendEmailCode = async (email, code, { purpose = "login" } = {}) => {
   const transporter = createTransporter();
   const from = String(process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
-const appName = String(process.env.APP_NAME || "武陵商厦").trim();
+  const appName = String(process.env.APP_NAME || "武陵商厦创作平台").trim();
   const purposeMeta = describeEmailCodePurpose(purpose);
 
   if (!transporter || !from) {
@@ -123,9 +123,9 @@ const resolveStoredRole = (row = {}) => {
   return shouldAutoPromoteEmail(row.email) ? "admin" : storedRole;
 };
 
-const toPublicUser = (user) => {
+const toPublicUser = (user, { includeAdminNote = false } = {}) => {
   const role = getEffectiveRole(user);
-  return {
+  const publicUser = {
     userId: user.user_id || user.userId,
     email: normalizeEmail(user.email),
     displayName:
@@ -140,6 +140,10 @@ const toPublicUser = (user) => {
     updatedAt: fromDbDateTime(user.updated_at || user.updatedAt),
     lastLoginAt: fromDbDateTime(user.last_login_at || user.lastLoginAt),
   };
+  if (includeAdminNote) {
+    publicUser.adminNote = String(user.admin_note || user.adminNote || "").trim();
+  }
+  return publicUser;
 };
 
 const createSession = (userId) => {
@@ -171,6 +175,7 @@ const ensureAuthSchema = async () => {
           user_id VARCHAR(32) PRIMARY KEY,
           email VARCHAR(255) NOT NULL UNIQUE,
           display_name VARCHAR(120) NULL,
+          admin_note TEXT NULL,
           password_hash VARCHAR(255) NULL,
           role VARCHAR(24) NOT NULL DEFAULT 'user',
           status VARCHAR(24) NOT NULL DEFAULT 'active',
@@ -183,6 +188,7 @@ const ensureAuthSchema = async () => {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
       `);
       await ensureColumn("ALTER TABLE auth_users ADD COLUMN display_name VARCHAR(120) NULL");
+      await ensureColumn("ALTER TABLE auth_users ADD COLUMN admin_note TEXT NULL");
       await ensureColumn("ALTER TABLE auth_users ADD COLUMN password_hash VARCHAR(255) NULL");
       await ensureColumn("ALTER TABLE auth_users ADD COLUMN role VARCHAR(24) NOT NULL DEFAULT 'user'");
       await ensureColumn("ALTER TABLE auth_users ADD COLUMN status VARCHAR(24) NOT NULL DEFAULT 'active'");
@@ -940,7 +946,7 @@ const normalizePagination = ({ page = 1, pageSize = 20 } = {}) => {
   };
 };
 
-const listAdminUsers = async ({ search = "", page = 1, pageSize = 20 } = {}) => {
+const listAdminUsers = async ({ search = "", page = 1, pageSize = 20, includeAdminNote = false } = {}) => {
   await ensureAuthSchema();
   await cleanupExpiredAuthArtifacts();
 
@@ -950,19 +956,43 @@ const listAdminUsers = async ({ search = "", page = 1, pageSize = 20 } = {}) => 
     pageSize,
   });
   const filters = [];
+  const aliasedFilters = [];
   const params = [];
+  const aliasedParams = [];
   if (trimmedSearch) {
     filters.push("(email LIKE ? OR display_name LIKE ? OR user_id LIKE ?)");
+    aliasedFilters.push("(u.email LIKE ? OR u.display_name LIKE ? OR u.user_id LIKE ?)");
     const pattern = `%${trimmedSearch}%`;
     params.push(pattern, pattern, pattern);
+    aliasedParams.push(pattern, pattern, pattern);
   }
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const aliasedWhereClause = aliasedFilters.length ? `WHERE ${aliasedFilters.join(" AND ")}` : "";
+  const safeOnlineWindowMinutes = 5;
+  const now = new Date();
+  const onlineCutoff = new Date(now.getTime() - safeOnlineWindowMinutes * 60 * 1000);
 
   const countRows = await query(
     `SELECT COUNT(*) AS total FROM auth_users ${whereClause}`,
     params,
   );
   const total = Number(countRows?.[0]?.total || 0);
+
+  const onlineSessionRows = await query(
+    `
+      SELECT user_id, MAX(last_seen_at) AS last_seen_at
+      FROM auth_sessions
+      WHERE expires_at > ? AND last_seen_at >= ?
+      GROUP BY user_id
+    `,
+    [toDbDateTime(now), toDbDateTime(onlineCutoff)],
+  );
+  const onlineStateMap = new Map();
+  for (const row of onlineSessionRows || []) {
+    const userId = String(row?.user_id || "").trim();
+    if (!userId) continue;
+    onlineStateMap.set(userId, fromDbDateTime(row.last_seen_at));
+  }
 
   const rows = await query(
     `
@@ -975,12 +1005,44 @@ const listAdminUsers = async ({ search = "", page = 1, pageSize = 20 } = {}) => 
     params,
   );
 
+  const onlineRows = await query(
+    `
+      SELECT u.*, s.last_seen_at
+      FROM auth_users u
+      INNER JOIN (
+        SELECT user_id, MAX(last_seen_at) AS last_seen_at
+        FROM auth_sessions
+        WHERE expires_at > ? AND last_seen_at >= ?
+        GROUP BY user_id
+      ) s ON s.user_id = u.user_id
+      ${aliasedWhereClause}
+      ORDER BY s.last_seen_at DESC, u.created_at DESC, u.user_id DESC
+      LIMIT 50
+    `,
+    [toDbDateTime(now), toDbDateTime(onlineCutoff), ...aliasedParams],
+  );
+
   return {
     total,
     page: safePage,
     pageSize: safePageSize,
     totalPages: Math.max(1, Math.ceil(total / safePageSize)),
-    users: rows.map((row) => toPublicUser(row)),
+    onlineTotal: onlineRows.length,
+    onlineWindowMinutes: safeOnlineWindowMinutes,
+    onlineUsers: onlineRows.map((row) => ({
+      ...toPublicUser(row, { includeAdminNote }),
+      isOnline: true,
+      lastSeenAt: fromDbDateTime(row.last_seen_at),
+    })),
+    users: rows.map((row) => {
+      const publicUser = toPublicUser(row, { includeAdminNote });
+      const lastSeenAt = onlineStateMap.get(publicUser.userId) || null;
+      return {
+        ...publicUser,
+        isOnline: Boolean(lastSeenAt),
+        lastSeenAt,
+      };
+    }),
   };
 };
 
@@ -1088,13 +1150,13 @@ const getAdminAuthOverview = async ({
   };
 };
 
-const getAdminUserById = async (userId) => {
+const getAdminUserById = async (userId, { includeAdminNote = false } = {}) => {
   await ensureAuthSchema();
   const targetUserId = String(userId || "").trim();
   if (!targetUserId) return null;
   const rows = await query("SELECT * FROM auth_users WHERE user_id = ? LIMIT 1", [targetUserId]);
   if (!rows?.[0]) return null;
-  return toPublicUser(rows[0]);
+  return toPublicUser(rows[0], { includeAdminNote });
 };
 
 const updateAdminUser = async (actor, userId, changes = {}) => {
@@ -1131,6 +1193,10 @@ const updateAdminUser = async (actor, userId, changes = {}) => {
       Object.prototype.hasOwnProperty.call(changes, "status")
         ? normalizeStatus(changes.status, normalizeStatus(existing.status, "active"))
         : normalizeStatus(existing.status, "active");
+    const nextAdminNote =
+      Object.prototype.hasOwnProperty.call(changes, "adminNote")
+        ? String(changes.adminNote || "").trim().slice(0, 2000)
+        : String(existing.admin_note || "").trim();
 
     if (!["user", "admin", "super_admin"].includes(nextRole)) {
       throw new AuthError("INVALID_USER_ROLE", "Unsupported user role");
@@ -1174,10 +1240,10 @@ const updateAdminUser = async (actor, userId, changes = {}) => {
     await connection.execute(
       `
         UPDATE auth_users
-        SET display_name = ?, role = ?, status = ?, updated_at = ?
+        SET display_name = ?, role = ?, status = ?, admin_note = ?, updated_at = ?
         WHERE user_id = ?
       `,
-      [nextDisplayName, nextRole, nextStatus, nowDb, targetUserId],
+      [nextDisplayName, nextRole, nextStatus, nextAdminNote || null, nowDb, targetUserId],
     );
 
     if (nextStatus !== "active") {
@@ -1189,112 +1255,9 @@ const updateAdminUser = async (actor, userId, changes = {}) => {
       display_name: nextDisplayName,
       role: nextRole,
       status: nextStatus,
+      admin_note: nextAdminNote,
       updated_at: nowDb,
-    });
-  });
-};
-
-const assertAdminCanManageRegularUser = (actor, targetUser) => {
-  if (!hasAdminRole(actor?.role)) {
-    throw new AuthError("ADMIN_REQUIRED", "Administrator access is required");
-  }
-
-  const targetRole = normalizeRole(targetUser?.role, "user");
-  if (targetRole !== "user") {
-    throw new AuthError(
-      "ADMIN_TARGET_RESTRICTED",
-      "Administrators can only manage regular users",
-    );
-  }
-};
-
-const resetAdminManagedUserPassword = async (
-  actor,
-  userId,
-  nextPassword = "1234567890",
-) => {
-  await ensureAuthSchema();
-  const targetUserId = String(userId || "").trim();
-  if (!targetUserId) {
-    throw new AuthError("USER_NOT_FOUND", "User does not exist");
-  }
-
-  const normalizedPassword = String(nextPassword || "").trim();
-  validatePassword(normalizedPassword);
-
-  return withTransaction(async (connection) => {
-    await cleanupExpiredAuthArtifacts(connection);
-    const [rows] = await connection.execute(
-      "SELECT * FROM auth_users WHERE user_id = ? LIMIT 1 FOR UPDATE",
-      [targetUserId],
-    );
-    const existing = rows[0];
-    if (!existing) {
-      throw new AuthError("USER_NOT_FOUND", "User does not exist");
-    }
-
-    assertAdminCanManageRegularUser(actor, existing);
-
-    const nowDb = toDbDateTime();
-    const passwordHash = await hashPassword(normalizedPassword);
-    await connection.execute(
-      `
-        UPDATE auth_users
-        SET password_hash = ?, password_updated_at = ?, updated_at = ?
-        WHERE user_id = ?
-      `,
-      [passwordHash, nowDb, nowDb, targetUserId],
-    );
-    await connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", [targetUserId]);
-
-    return toPublicUser({
-      ...existing,
-      password_hash: passwordHash,
-      password_updated_at: nowDb,
-      updated_at: nowDb,
-    });
-  });
-};
-
-const setAdminManagedUserStatus = async (actor, userId, status) => {
-  await ensureAuthSchema();
-  const targetUserId = String(userId || "").trim();
-  if (!targetUserId) {
-    throw new AuthError("USER_NOT_FOUND", "User does not exist");
-  }
-
-  return withTransaction(async (connection) => {
-    await cleanupExpiredAuthArtifacts(connection);
-    const [rows] = await connection.execute(
-      "SELECT * FROM auth_users WHERE user_id = ? LIMIT 1 FOR UPDATE",
-      [targetUserId],
-    );
-    const existing = rows[0];
-    if (!existing) {
-      throw new AuthError("USER_NOT_FOUND", "User does not exist");
-    }
-
-    assertAdminCanManageRegularUser(actor, existing);
-
-    const nextStatus = normalizeStatus(status, normalizeStatus(existing.status, "active"));
-    if (!["active", "disabled"].includes(nextStatus)) {
-      throw new AuthError("INVALID_USER_STATUS", "Unsupported user status");
-    }
-
-    const nowDb = toDbDateTime();
-    await connection.execute(
-      "UPDATE auth_users SET status = ?, updated_at = ? WHERE user_id = ?",
-      [nextStatus, nowDb, targetUserId],
-    );
-    if (nextStatus !== "active") {
-      await connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", [targetUserId]);
-    }
-
-    return toPublicUser({
-      ...existing,
-      status: nextStatus,
-      updated_at: nowDb,
-    });
+    }, { includeAdminNote: true });
   });
 };
 
@@ -1314,11 +1277,9 @@ module.exports = {
   registerWithPassword,
   resetPasswordWithEmailCode,
   requestEmailCode,
-  resetAdminManagedUserPassword,
   requireAdminAccess,
   requireAuthUser,
   requireSuperAdminAccess,
-  setAdminManagedUserStatus,
   setUserPassword,
   toPublicUser,
   updateAdminUser,

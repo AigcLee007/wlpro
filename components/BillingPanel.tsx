@@ -19,7 +19,6 @@ import {
   createBillingRedeemCodes,
   fetchBillingAccount,
   fetchBillingRedeemCodes,
-  runBillingCompensationScan,
   RedeemCodeListPayload,
   redeemBillingCode,
 } from '../src/services/accountService';
@@ -57,13 +56,6 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
   const [codeFilter, setCodeFilter] = useState<'all' | 'active' | 'redeemed'>('all');
   const [codeData, setCodeData] = useState<RedeemCodeListPayload | null>(null);
   const [codesLoading, setCodesLoading] = useState(false);
-  const [compensating, setCompensating] = useState(false);
-  const [compensationReport, setCompensationReport] = useState<{
-    scanned: number;
-    compensated: number;
-    alreadySettled: number;
-    pendingTimeoutMinutes: number;
-  } | null>(null);
 
   const loadAccount = useCallback(async () => {
     if (!isAuthenticated) {
@@ -214,34 +206,6 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
     }
   };
 
-  const handleCompensationScan = async () => {
-    const confirmed = window.confirm(
-      '确认执行历史异常订单补偿扫描吗？系统会自动补偿可确定异常的订单（超时未结算或失败未退款）。',
-    );
-    if (!confirmed) return;
-
-    setCompensating(true);
-    setError(null);
-    try {
-      const result = await runBillingCompensationScan({
-        pendingTimeoutMinutes: 30,
-        limit: 1000,
-      });
-      setCompensationReport({
-        scanned: result.scanned,
-        compensated: result.compensated,
-        alreadySettled: result.alreadySettled,
-        pendingTimeoutMinutes: result.pendingTimeoutMinutes,
-      });
-      toast.success(`补偿扫描完成：补偿 ${result.compensated} 条，扫描 ${result.scanned} 条`);
-      await loadAccount();
-    } catch (scanError) {
-      setError((scanError as Error).message);
-    } finally {
-      setCompensating(false);
-    }
-  };
-
   return (
     <div className="space-y-4 rounded-3xl border border-amber-500/20 bg-linear-to-br from-amber-500/10 via-amber-500/5 to-transparent p-5">
       <div className="flex items-start justify-between gap-3">
@@ -251,7 +215,7 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
             点数账户
           </div>
           <p className="mt-1 text-xs leading-6 text-amber-100/70">
-            这里保留账户摘要和兑换入口，完整统计、筛选和分页账本已迁移到账单中心。
+            这里保留账户摘要和兑换入口，完整统计、筛选和分页账本已迁移到额度明细。
           </p>
         </div>
 
@@ -275,7 +239,7 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
 
       {!isAuthenticated ? (
         <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-4 text-sm text-gray-300">
-          请先登录后再查看点数、兑换码和账单中心。
+          请先登录后再查看点数、兑换码和额度明细。
         </div>
       ) : (
         <>
@@ -317,7 +281,7 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
                   兑换码兑换
                 </div>
                 <p className="mt-1 text-xs leading-6 text-sky-100/70">
-                  成功到账后会立即刷新当前点数；更详细的流水和统计请到账单中心查看。
+                  成功到账后会立即刷新当前点数；更详细的流水和统计请到额度明细查看。
                 </p>
               </div>
               <button
@@ -328,7 +292,7 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
                 className="inline-flex h-10 items-center gap-2 rounded-xl border border-sky-300/20 bg-sky-400/10 px-4 text-xs font-medium text-sky-100 transition-colors hover:bg-sky-400/20"
               >
                 <CreditCard size={14} />
-                打开账单中心
+                打开额度明细
                 <ArrowRight size={14} />
               </button>
             </div>
@@ -356,31 +320,6 @@ const BillingPanel: React.FC<BillingPanelProps> = ({ session }) => {
 
       {isSuperAdmin && (
         <>
-          <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
-            <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-100">
-              <ShieldCheck size={16} />
-              历史异常订单补偿
-            </div>
-            <p className="mb-3 text-xs leading-6 text-amber-100/80">
-              一键扫描并补偿历史异常订单。只处理可确认异常：超时未结算、失败但未退款。
-            </p>
-            <button
-              type="button"
-              onClick={() => void handleCompensationScan()}
-              disabled={compensating}
-              className="inline-flex h-10 items-center gap-2 rounded-xl bg-amber-600 px-4 text-sm font-medium text-white transition-colors hover:bg-amber-500 disabled:opacity-60"
-            >
-              {compensating ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              一键补偿扫描
-            </button>
-
-            {compensationReport && (
-              <div className="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-3 text-xs text-amber-50">
-                扫描 {compensationReport.scanned} 条，补偿 {compensationReport.compensated} 条，已处理/无需补偿 {compensationReport.alreadySettled} 条（超时阈值 {compensationReport.pendingTimeoutMinutes} 分钟）。
-              </div>
-            )}
-          </div>
-
           <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4">
             <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-emerald-100">
               <ShieldCheck size={16} />

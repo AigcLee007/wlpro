@@ -4,7 +4,6 @@ import MobileView from "./components/MobileView";
 import Toolbar from "./components/Toolbar";
 import MultiSelectToolbar from "./components/MultiSelectToolbar";
 import ControlPanel from "./components/ControlPanel";
-import InpaintWindow from "./components/InpaintWindow";
 import AdminDashboardPage from "./components/AdminDashboardPage";
 import BillingCenterPage from "./components/BillingCenterPage";
 import { Settings, CheckCircle, LayoutGrid, Wallet } from "lucide-react";
@@ -19,6 +18,12 @@ import { MainLayout } from "./src/layouts/MainLayout";
 import { ModalsContainer } from "./src/layouts/ModalsContainer";
 import { assetStorage } from "./src/services/assetStorage";
 import { isLowEndDevice } from "./src/utils/performance";
+import {
+  AUTH_SESSION_CHANGE_EVENT,
+  fetchCurrentAuthSession,
+  getStoredAuthSessionToken,
+} from "./src/services/accountIdentity";
+import { BillingAccountProfile, fetchBillingAccount } from "./src/services/accountService";
 
 // New Hooks
 import { useTaskRecovery } from "./src/hooks/useTaskRecovery";
@@ -28,16 +33,35 @@ import { useFileDrop } from "./src/hooks/useFileDrop";
 import { useGlobalPolling } from "./src/hooks/useGlobalPolling";
 
 const App: React.FC = () => {
+  const currentPath =
+    typeof window !== "undefined" ? window.location.pathname : "/";
+  const preferredCreateUi =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem("preferred-create-ui")
+      : null;
+  const isInitialMobileViewport =
+    typeof window !== "undefined" &&
+    (window.innerWidth < 640 ||
+      window.matchMedia?.("(max-width: 639px)")?.matches === true);
   const classicModePreferred =
     typeof window !== "undefined" &&
-    window.location.pathname === "/" &&
-    window.localStorage.getItem("preferred-create-ui") === "classic";
+    currentPath === "/" &&
+    preferredCreateUi === "classic";
   const isAdminRoute =
     typeof window !== "undefined" &&
-    window.location.pathname.startsWith("/admin");
+    currentPath.startsWith("/admin");
   const isBillingRoute =
     typeof window !== "undefined" &&
-    window.location.pathname.startsWith("/billing");
+    currentPath.startsWith("/billing");
+  const isClassicCreateRoute =
+    typeof window !== "undefined" && currentPath.startsWith("/create/classic");
+  const mobileShouldDefaultToClassic =
+    typeof window !== "undefined" &&
+    isInitialMobileViewport &&
+    !isAdminRoute &&
+    !isBillingRoute &&
+    !isClassicCreateRoute &&
+    (currentPath === "/" || preferredCreateUi !== "canvas");
 
   if (isAdminRoute) {
     return <AdminDashboardPage />;
@@ -47,7 +71,7 @@ const App: React.FC = () => {
     return <BillingCenterPage />;
   }
 
-  if (classicModePreferred) {
+  if (classicModePreferred || mobileShouldDefaultToClassic) {
     window.location.replace("/create/classic");
     return null;
   }
@@ -65,6 +89,10 @@ const App: React.FC = () => {
   } = useCanvasStore();
 
   const [hydrated, setHydrated] = useState(false);
+  const [isAccountAuthenticated, setIsAccountAuthenticated] = useState<boolean>(() =>
+    Boolean(getStoredAuthSessionToken()),
+  );
+  const [billingAccount, setBillingAccount] = useState<BillingAccountProfile | null>(null);
 
   useEffect(() => {
     // Check if already hydrated
@@ -104,6 +132,49 @@ const App: React.FC = () => {
     };
     hydrate();
   }, [hydrated]); // Removed nodes from dep array to avoid infinite loop. Runs once on hydration.
+
+  useEffect(() => {
+    let active = true;
+    const syncAuthState = async () => {
+      const hasToken = Boolean(getStoredAuthSessionToken());
+      if (!hasToken) {
+        if (active) setIsAccountAuthenticated(false);
+        return;
+      }
+      if (active) setIsAccountAuthenticated(true);
+      try {
+        const session = await fetchCurrentAuthSession();
+        if (!active) return;
+        setIsAccountAuthenticated(Boolean(session?.authenticated));
+        if (session?.authenticated) {
+          const accountPayload = await fetchBillingAccount({ ledgerPage: 1, ledgerPageSize: 1 }).catch(() => null);
+          if (active) setBillingAccount(accountPayload?.account || null);
+        } else if (active) {
+          setBillingAccount(null);
+        }
+      } catch (_) {
+        if (!active) return;
+        setIsAccountAuthenticated(false);
+        setBillingAccount(null);
+      }
+    };
+
+    void syncAuthState();
+
+    if (typeof window === "undefined") {
+      return () => {
+        active = false;
+      };
+    }
+
+    window.addEventListener(AUTH_SESSION_CHANGE_EVENT, syncAuthState);
+    window.addEventListener("storage", syncAuthState);
+    return () => {
+      active = false;
+      window.removeEventListener(AUTH_SESSION_CHANGE_EVENT, syncAuthState);
+      window.removeEventListener("storage", syncAuthState);
+    };
+  }, []);
 
   const {
     selectedIds,
@@ -223,6 +294,8 @@ const App: React.FC = () => {
   const [modalOpen, setModalOpen] = useState(false);
   const [modalTab, setModalTab] = useState<"settings" | "history">("settings");
   const [reversePromptOpen, setReversePromptOpen] = useState(false);
+  const [batchModalOpen, setBatchModalOpen] = useState(false);
+  const handleOpenBatch = useCallback(() => setBatchModalOpen(true), []);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
 
   // Mobile Detection - Use 640px threshold to avoid F12 devtools triggering mobile view
@@ -260,7 +333,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!window.location.pathname.startsWith("/create/classic")) {
+    const isMobileViewport = window.innerWidth < 640;
+    if (!isMobileViewport && !window.location.pathname.startsWith("/create/classic")) {
       window.localStorage.setItem("preferred-create-ui", "canvas");
     }
   }, []);
@@ -356,6 +430,7 @@ const App: React.FC = () => {
              settingsOpen={modalOpen}
              settingsTab={modalTab}
              onCloseSettings={() => setModalOpen(false)}
+             onOpenSettings={() => openModal("settings")}
              onReusePrompt={(prompt, type) => {
                setModalOpen(false);
                useSelectionStore
@@ -379,6 +454,11 @@ const App: React.FC = () => {
              reversePromptOpen={false}
              onCloseReversePrompt={() => {}}
              onUsePrompt={() => {}}
+             batchModalOpen={false}
+             onCloseBatchModal={() => {}}
+             batchApiKey=""
+             onInitGenerations={() => []}
+             onUpdateGeneration={async () => {}}
              instructionsOpen={false}
              onCloseInstructions={() => {}}
              lightboxImage={lightboxImage}
@@ -410,12 +490,13 @@ const App: React.FC = () => {
           onInitGenerations={handleInitGenerations}
           onUpdateGeneration={handleUpdateGeneration}
           onUpdateProgress={handleUpdateProgress}
+          onOpenBatchModal={handleOpenBatch}
         />
-        <InpaintWindow />
         <ModalsContainer
           settingsOpen={modalOpen}
           settingsTab={modalTab}
           onCloseSettings={() => setModalOpen(false)}
+          onOpenSettings={() => openModal("settings")}
           onReusePrompt={(prompt, type) => {
             setModalOpen(false);
             useSelectionStore
@@ -440,6 +521,11 @@ const App: React.FC = () => {
           reversePromptOpen={false}
           onCloseReversePrompt={() => {}}
           onUsePrompt={() => {}}
+          batchModalOpen={false}
+          onCloseBatchModal={() => {}}
+          batchApiKey=""
+          onInitGenerations={() => []}
+          onUpdateGeneration={async () => {}}
           instructionsOpen={false}
           onCloseInstructions={() => {}}
           showClearConfirm={false}
@@ -485,6 +571,7 @@ const App: React.FC = () => {
           onOpenInstructions={() => setInstructionsOpen(true)}
           onArrange={handleArrangeNodes}
           onOpenReversePrompt={() => setReversePromptOpen(true)}
+          onOpenBatchModal={handleOpenBatch}
           onDownloadAllCanvas={handleDownloadAllCanvas}
           isDownloadingCanvas={isDownloadingCanvas}
           onOpenClassicMode={openClassicMode}
@@ -496,14 +583,14 @@ const App: React.FC = () => {
           onInitGenerations={handleInitGenerations}
           onUpdateGeneration={handleUpdateGeneration}
           onUpdateProgress={handleUpdateProgress}
+          onOpenBatchModal={handleOpenBatch}
         />
-
-        <InpaintWindow />
 
         <ModalsContainer
           settingsOpen={modalOpen}
           settingsTab={modalTab}
           onCloseSettings={() => setModalOpen(false)}
+          onOpenSettings={() => openModal("settings")}
           onReusePrompt={(prompt, type) => {
             setModalOpen(false);
             useSelectionStore
@@ -528,6 +615,11 @@ const App: React.FC = () => {
             useSelectionStore.getState().setPendingPrompt(prompt);
             setToolMode(ToolMode.GENERATE);
           }}
+          batchModalOpen={batchModalOpen}
+          onCloseBatchModal={() => setBatchModalOpen(false)}
+          batchApiKey={useSelectionStore.getState().apiKey}
+          onInitGenerations={handleInitGenerations}
+          onUpdateGeneration={handleUpdateGeneration}
           instructionsOpen={instructionsOpen}
           onCloseInstructions={() => setInstructionsOpen(false)}
           lightboxImage={lightboxImage}
@@ -549,16 +641,14 @@ const App: React.FC = () => {
           }}
         />
 
-        {nodes.length === 0 && status === AppStatus.IDLE && (
+        {nodes.length === 0 && status === AppStatus.IDLE && !isAccountAuthenticated && (
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none flex flex-col items-center justify-center select-none w-full max-w-2xl mt-[-5vh]">
-            <div className="mb-12 flex items-end justify-center gap-3">
-              <h1 className="text-4xl font-black tracking-tight leading-none bg-gradient-to-b from-sky-300 via-cyan-400 to-blue-600 bg-clip-text text-transparent sm:text-5xl">
-                武陵商厦
-              </h1>
-              <span className="inline-flex items-center rounded-md border border-red-300/35 bg-linear-to-r from-red-500 to-red-600 px-3 py-1 text-sm font-bold text-white shadow-[0_0_18px_rgba(239,68,68,0.38)]">
-                武陵商厦
+            <h1 className="text-5xl font-black text-transparent bg-clip-text bg-linear-to-r from-sky-300 via-cyan-400 to-blue-500 drop-shadow-[0_0_22px_rgba(14,165,233,0.35)] mb-10 flex items-center justify-center font-sans">
+              武陵商厦
+              <span className="ml-4 -skew-x-12 rounded-lg bg-red-500 px-3 py-1 text-base font-black text-white shadow-[0_0_18px_rgba(239,68,68,0.45)]">
+                企业版
               </span>
-            </div>
+            </h1>
 
             <div className="flex flex-col items-center bg-[#121212]/60 backdrop-blur-xl p-10 rounded-[32px] border border-white/10 shadow-[0_20px_60px_rgba(0,0,0,0.5)] max-w-lg text-center relative pointer-events-auto">
               <div className="absolute top-6 right-6 flex h-3 w-3">
@@ -573,11 +663,11 @@ const App: React.FC = () => {
               </div>
 
               <h2 className="text-2xl font-bold tracking-tight text-white mb-3">
-                账号制创作工作台
+                武陵商厦创作工作台
               </h2>
 
               <p className="text-gray-400 text-sm leading-relaxed mb-8 max-w-sm">
-                武陵商厦企业创作平台已启用。请先登录企业账号，再使用创作与管理能力。
+                请先登录企业账号。登录后可直接使用站内点数、企业模型和创作管理能力。
               </p>
 
               <button
@@ -586,14 +676,63 @@ const App: React.FC = () => {
               >
                 <div className="absolute inset-0 bg-linear-to-r from-emerald-200 via-white to-cyan-200 opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
                 <Settings size={18} className="relative z-10 text-black/80" />
-                <span className="relative z-10">登录 / 管理账户</span>
+                <span className="relative z-10">登录企业账户</span>
               </button>
-
             </div>
 
             <div className="mt-8 px-6 py-2.5 bg-white/[0.03] rounded-full border border-white/5 text-xs text-gray-500 flex items-center gap-2.5 backdrop-blur-sm">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-gray-400"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
               也可以直接拖拽本地图片到画布开始创作
+            </div>
+          </div>
+        )}
+
+        {nodes.length === 0 && status === AppStatus.IDLE && isAccountAuthenticated && (
+          <div className="absolute top-[46%] left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none flex w-full max-w-3xl flex-col items-center justify-center px-6 text-center select-none">
+            <div className="mb-8 flex items-center justify-center">
+              <h1 className="text-5xl font-black text-transparent bg-clip-text bg-linear-to-r from-sky-300 via-cyan-400 to-blue-500 drop-shadow-[0_0_22px_rgba(14,165,233,0.35)]">
+                武陵商厦
+              </h1>
+              <span className="ml-4 -skew-x-12 rounded-lg bg-red-500 px-3 py-1 text-base font-black text-white shadow-[0_0_18px_rgba(239,68,68,0.45)]">
+                企业版
+              </span>
+            </div>
+
+            <div className="pointer-events-auto rounded-[30px] border border-white/10 bg-[#111318]/72 p-7 shadow-[0_22px_70px_rgba(0,0,0,0.46)] backdrop-blur-xl">
+              <div className="flex flex-col items-center gap-5 sm:flex-row sm:text-left">
+                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-sky-400/25 bg-sky-400/10 text-sky-200">
+                  <CheckCircle size={28} />
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-white">企业账号已连接</h2>
+                  <p className="mt-2 max-w-xl text-sm leading-6 text-gray-400">
+                    当前可直接开始创作，也可以拖拽本地图片到画布作为参考图。剩余点数：
+                    <span className="font-semibold text-sky-200">
+                      {billingAccount ? `${Number(billingAccount.points || 0).toFixed(1)} 点` : '读取中'}
+                    </span>
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-6 flex flex-wrap justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setToolMode(ToolMode.GENERATE);
+                    useSelectionStore.getState().setControlPanelOpen(true);
+                  }}
+                  className="inline-flex h-11 items-center justify-center rounded-full bg-white px-5 text-sm font-bold text-black transition-transform hover:scale-105 active:scale-95"
+                >
+                  开始创作
+                </button>
+                <button
+                  type="button"
+                  onClick={openClassicMode}
+                  className="inline-flex h-11 items-center justify-center rounded-full border border-sky-300/30 bg-sky-400/10 px-5 text-sm font-semibold text-sky-100 hover:bg-sky-400/15"
+                >
+                  进入经典版
+                </button>
+              </div>
             </div>
           </div>
         )}

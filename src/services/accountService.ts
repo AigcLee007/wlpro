@@ -1,13 +1,10 @@
-import {
+﻿import {
   AuthUserProfile,
   ensureBillingIdentity,
   getAuthorizedBillingHeaders,
 } from './accountIdentity';
 
-const API_BASE_URL =
-  typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
-    : '/api';
+const API_BASE_URL = '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 
@@ -119,16 +116,6 @@ export interface RedeemCodeListPayload {
   pageSize: number;
   totalPages: number;
   codes: RedeemCodeRecord[];
-}
-
-export interface CompensationScanPayload {
-  success: boolean;
-  scanned: number;
-  compensated: number;
-  alreadySettled: number;
-  pendingTimeoutMinutes: number;
-  refundedTaskIds: string[];
-  failedTaskIds: string[];
 }
 
 const parseResponse = async <T>(response: Response): Promise<T> => {
@@ -347,26 +334,3 @@ export const fetchBillingRedeemCodes = async ({
   return parseResponse<RedeemCodeListPayload>(response);
 };
 
-export const runBillingCompensationScan = async ({
-  pendingTimeoutMinutes = 30,
-  limit = 500,
-}: {
-  pendingTimeoutMinutes?: number;
-  limit?: number;
-} = {}): Promise<CompensationScanPayload> => {
-  await ensureBillingIdentity();
-
-  const response = await fetch(`${cleanUrl(API_BASE_URL)}/admin/billing/compensation-scan`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await getAuthorizedBillingHeaders()),
-    },
-    body: JSON.stringify({
-      pendingTimeoutMinutes,
-      limit,
-    }),
-  });
-
-  return parseResponse<CompensationScanPayload>(response);
-};

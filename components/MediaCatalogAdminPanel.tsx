@@ -379,7 +379,7 @@ const createVideoRouteForm = (route?: Partial<AdminVideoRoute>, family = 'defaul
   description: String(route?.description || '').trim(),
   routeFamily: String(route?.routeFamily || family).trim(),
   line: String(route?.line || 'line1').trim(),
-  transport: (route?.transport || 'openai-video') as AdminVideoRoutePayload['transport'],
+  transport: 'openai-video',
   mode: 'async',
   baseUrl: String(route?.baseUrl || '').trim(),
   generatePath: String(route?.generatePath || '/v2/videos/generations').trim(),
@@ -401,36 +401,13 @@ const applyImageRoutePreset = <T extends AdminImageRoutePayload>(
 ): T =>
   preset === 'openai'
     ? { ...route, transport: 'openai-image' as const, mode: 'async' as const, generatePath: '/v1/images/generations?async=true', taskPath: '/v1/images/tasks/{taskId}', editPath: '/v1/images/edits?async=true', chatPath: '', useRequestModel: false, allowUserApiKeyWithoutLogin: false }
-    : { ...route, transport: 'gemini-native' as const, mode: 'sync' as const, generatePath: '/v1beta/models/{model}:generateContent', taskPath: '', editPath: '', chatPath: '', useRequestModel: false, allowUserApiKeyWithoutLogin: false };
-
-const applyVideoRoutePreset = <T extends AdminVideoRoutePayload>(
-  route: T,
-  preset: 'openai' | 'gemini',
-): T =>
-  preset === 'openai'
-    ? {
-        ...route,
-        transport: 'openai-video' as const,
-        mode: 'async' as const,
-        generatePath: '/v2/videos/generations',
-        taskPath: '/v2/videos/generations/{taskId}',
-        useRequestModel: false,
-      }
-    : {
-        ...route,
-        transport: 'gemini-native' as const,
-        mode: 'async' as const,
-        generatePath: '/v1beta/models/{model}:predictLongRunning',
-        taskPath: '/v1beta/operations/{taskId}',
-        useRequestModel: false,
-      };
+    : { ...route, transport: 'gemini-native' as const, mode: 'async' as const, generatePath: '/v1beta/models/{model}:generateContent', taskPath: '', editPath: '', chatPath: '', useRequestModel: false, allowUserApiKeyWithoutLogin: false };
 
 const validateImageRoutePayload = (payload: AdminImageRoutePayload) => {
   const generatePath = String(payload.generatePath || '').trim();
   if (!payload.id || !payload.label || !payload.modelFamily || !payload.line || !payload.baseUrl) return '图片线路请至少填写 route id、显示名称、线路族、line 和 baseUrl。';
   if (payload.transport === 'openai-image' && /generatecontent/i.test(generatePath)) return 'OpenAI 图片线路不能填写 Gemini generateContent 接口。';
   if (payload.transport === 'openai-image' && payload.mode === 'async' && !String(payload.taskPath || '').trim()) return 'OpenAI 异步图片线路必须填写 taskPath。';
-  if (payload.transport === 'gemini-native' && payload.mode !== 'sync') return 'Gemini 原生图片线路只能使用 sync 模式。';
   if (payload.transport === 'gemini-native' && !/\{model\}/.test(generatePath)) return 'Gemini 原生线路的 generatePath 必须包含 {model}。';
   if (payload.transport === 'gemini-native' && !payload.useRequestModel && !String(payload.upstreamModel || '').trim() && !hasImageRouteSizeOverrideModel(payload)) return 'Gemini 原生线路需要填写默认 upstreamModel、尺寸覆写模型，或开启“使用模型请求名”。';
   if (payload.allowUserApiKeyWithoutLogin && !(payload.transport === 'openai-image' && payload.mode === 'async')) return '“允许用户 API Key 免登录”只适用于 OpenAI 兼容异步图片线路。';
@@ -439,12 +416,8 @@ const validateImageRoutePayload = (payload: AdminImageRoutePayload) => {
 
 const validateVideoRoutePayload = (payload: AdminVideoRoutePayload) => {
   if (!payload.id || !payload.label || !payload.routeFamily || !payload.line || !payload.baseUrl) return '视频线路请至少填写 route id、显示名称、线路族、line 和 baseUrl。';
-  if (!String(payload.generatePath || '').trim()) return '视频线路必须填写 generatePath。';
-  if (!String(payload.taskPath || '').trim()) return '视频线路必须填写 taskPath。';
+  if (!String(payload.taskPath || '').trim()) return '视频异步线路必须填写 taskPath。';
   if (!payload.useRequestModel && !String(payload.upstreamModel || '').trim()) return '视频线路需要填写 upstreamModel，或开启“使用模型请求名”。';
-  if (payload.transport === 'gemini-native' && !String(payload.generatePath || '').includes('{model}') && !payload.useRequestModel && !String(payload.upstreamModel || '').trim()) {
-    return 'Gemini 视频线路建议在 generatePath 使用 {model}，或填写 upstreamModel，或开启“使用模型请求名”。';
-  }
   return null;
 };
 
@@ -563,7 +536,7 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
       if (editor.kind === 'image-route') {
         const payload: AdminImageRoutePayload = {
           ...imageRouteForm,
-          id: slugify(imageRouteForm.id, 'image-route'),
+          id: String(imageRouteForm.id || '').trim(),
           label: imageRouteForm.label.trim() || buildLineLabel(imageRouteForm.line),
           description: imageRouteForm.description?.trim() || '',
           modelFamily: imageRouteForm.modelFamily.trim(),
@@ -590,7 +563,7 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
         if (editor.mode === 'create') { await createAdminVideoModel(payload); toast.success('视频模型已创建。'); } else { await updateAdminVideoModel(editor.targetId || payload.id, payload); toast.success('视频模型已更新。'); }
       }
       if (editor.kind === 'video-route') {
-        const payload: AdminVideoRoutePayload = { ...videoRouteForm, id: slugify(videoRouteForm.id, 'video-route'), label: videoRouteForm.label.trim() || buildLineLabel(videoRouteForm.line), description: videoRouteForm.description?.trim() || '', routeFamily: videoRouteForm.routeFamily.trim(), line: videoRouteForm.line.trim().toLowerCase(), baseUrl: videoRouteForm.baseUrl.trim(), generatePath: videoRouteForm.generatePath.trim(), taskPath: videoRouteForm.taskPath?.trim() || '', upstreamModel: videoRouteForm.upstreamModel?.trim() || '', apiKeyEnv: videoRouteForm.apiKeyEnv?.trim() || '', apiKey: sanitizeApiKeyInput(videoRouteForm.apiKey), pointCost: roundNonNegativePoint(videoRouteForm.pointCost || 0, 0), sortOrder: Number(videoRouteForm.sortOrder || 0) };
+        const payload: AdminVideoRoutePayload = { ...videoRouteForm, id: String(videoRouteForm.id || '').trim(), label: videoRouteForm.label.trim() || buildLineLabel(videoRouteForm.line), description: videoRouteForm.description?.trim() || '', routeFamily: videoRouteForm.routeFamily.trim(), line: videoRouteForm.line.trim().toLowerCase(), baseUrl: videoRouteForm.baseUrl.trim(), generatePath: videoRouteForm.generatePath.trim(), taskPath: videoRouteForm.taskPath?.trim() || '', upstreamModel: videoRouteForm.upstreamModel?.trim() || '', apiKeyEnv: videoRouteForm.apiKeyEnv?.trim() || '', apiKey: sanitizeApiKeyInput(videoRouteForm.apiKey), pointCost: roundNonNegativePoint(videoRouteForm.pointCost || 0, 0), sortOrder: Number(videoRouteForm.sortOrder || 0) };
         const validationError = validateVideoRoutePayload(payload);
         if (validationError) throw new Error(validationError);
         if (editor.mode === 'create') { await createAdminVideoRoute(payload); toast.success('视频线路已创建。'); } else { await updateAdminVideoRoute(editor.targetId || payload.id, payload); toast.success('视频线路已更新。'); }
@@ -799,8 +772,8 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
             description: route.description || '',
             routeFamily: targetModel.routeFamily,
             line,
-            transport: route.transport,
-            mode: route.mode,
+            transport: 'openai-video',
+            mode: 'async',
             baseUrl: route.baseUrl,
             generatePath: route.generatePath,
             taskPath: route.taskPath || '',
@@ -1092,7 +1065,7 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
           </div>
           <div className="space-y-2 text-xs leading-5 text-cyan-100/85">
             <p>OpenAI 图片异步：`openai-image + async + /v1/images/generations?async=true + taskPath`。</p>
-            <p>Gemini 同步：`gemini-native + sync + /v1beta/models/{'{model}'}:generateContent`。</p>
+            <p>Gemini 原生：`gemini-native + async + /v1beta/models/{'{model}'}:generateContent`，后端会包装成本地异步任务。</p>
             <p>默认 `upstreamModel` 和默认点数会作为兜底；如果填写 1K / 2K / 4K 覆写，则这些尺寸会优先走各自的模型和点数。</p>
             <p>如果你想兼容旧用户 Key，只建议给 OpenAI 异步线路打开“允许用户 API Key 免登录”。</p>
           </div>
@@ -1489,151 +1462,7 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
           {editor?.kind === 'image-model' ? <div className="mt-5 space-y-4"><div className="grid gap-3 sm:grid-cols-2"><div className="sm:col-span-2"><Input value={imageModelForm.id} onChange={(e) => setImageModelForm((prev) => ({ ...prev, id: e.target.value }))} placeholder="model id" /><HelpText>模型唯一 ID，例如 `nano-banana-pro`。</HelpText></div><div className="sm:col-span-2"><Input value={imageModelForm.label} onChange={(e) => setImageModelForm((prev) => ({ ...prev, label: e.target.value }))} placeholder="显示名称" /></div><div className="sm:col-span-2"><Textarea value={imageModelForm.description || ''} onChange={(e) => setImageModelForm((prev) => ({ ...prev, description: e.target.value }))} placeholder="模型说明" /></div><Input value={imageModelForm.modelFamily} onChange={(e) => setImageModelForm((prev) => ({ ...prev, modelFamily: e.target.value }))} placeholder="modelFamily" /><Input value={imageModelForm.routeFamily} onChange={(e) => setImageModelForm((prev) => ({ ...prev, routeFamily: e.target.value }))} placeholder="routeFamily" /><Input value={imageModelForm.requestModel || ''} onChange={(e) => setImageModelForm((prev) => ({ ...prev, requestModel: e.target.value }))} placeholder="requestModel" /><Input type="number" step="0.1" min="0" value={String(imageModelForm.selectorCost || 0)} onChange={(e) => setImageModelForm((prev) => ({ ...prev, selectorCost: roundNonNegativePoint(e.target.value, 0) }))} placeholder="selectorCost" /><Select value={imageModelForm.iconKind} onChange={(e) => setImageModelForm((prev) => ({ ...prev, iconKind: e.target.value as AdminImageModelPayload['iconKind'] }))}><option value="banana">banana</option><option value="banana-zap">banana-zap</option><option value="sparkles">sparkles</option><option value="layers">layers</option><option value="zap">zap</option><option value="none">none</option></Select><Select value={imageModelForm.panelLayout} onChange={(e) => setImageModelForm((prev) => ({ ...prev, panelLayout: e.target.value as AdminImageModelPayload['panelLayout'] }))}><option value="nano-banana">nano-banana</option><option value="default">default</option><option value="compact">compact</option></Select><Select value={imageModelForm.sizeBehavior} onChange={(e) => setImageModelForm((prev) => ({ ...prev, sizeBehavior: e.target.value as AdminImageModelPayload['sizeBehavior'] }))}><option value="passthrough">passthrough</option><option value="doubao-v5">doubao-v5</option><option value="doubao-v45">doubao-v45</option><option value="z-image-turbo">z-image-turbo</option></Select><Input value={imageModelForm.defaultSize || ''} onChange={(e) => setImageModelForm((prev) => ({ ...prev, defaultSize: e.target.value }))} placeholder="defaultSize" /><div className="sm:col-span-2"><Input value={imageModelForm.sizeOptionsInput} onChange={(e) => setImageModelForm((prev) => ({ ...prev, sizeOptionsInput: e.target.value }))} placeholder="sizeOptions，用逗号分隔" /></div><div className="sm:col-span-2"><Input value={imageModelForm.extraAspectRatiosInput} onChange={(e) => setImageModelForm((prev) => ({ ...prev, extraAspectRatiosInput: e.target.value }))} placeholder="额外比例，用逗号分隔" /></div><Input type="number" value={String(imageModelForm.sortOrder || 0)} onChange={(e) => setImageModelForm((prev) => ({ ...prev, sortOrder: Number(e.target.value || 0) }))} placeholder="sortOrder" /><div className="sm:col-span-2 grid gap-2 sm:grid-cols-2"><Toggle checked={imageModelForm.showSizeSelector !== false} onChange={(checked) => setImageModelForm((prev) => ({ ...prev, showSizeSelector: checked }))} label="显示尺寸选择器" /><Toggle checked={imageModelForm.supportsCustomRatio !== false} onChange={(checked) => setImageModelForm((prev) => ({ ...prev, supportsCustomRatio: checked }))} label="允许自定义比例" /><Toggle checked={imageModelForm.isActive !== false} onChange={(checked) => setImageModelForm((prev) => ({ ...prev, isActive: checked }))} label="启用" /><Toggle checked={imageModelForm.isDefaultModel === true} onChange={(checked) => setImageModelForm((prev) => ({ ...prev, isDefaultModel: checked }))} label="默认模型" /></div></div></div> : null}
           {renderImageRouteEditor()}
           {editor?.kind === 'video-model' ? <div className="mt-5 space-y-4"><div className="grid gap-3 sm:grid-cols-2"><div className="sm:col-span-2"><Input value={videoModelForm.id} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, id: e.target.value }))} placeholder="model id" /></div><div className="sm:col-span-2"><Input value={videoModelForm.label} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, label: e.target.value }))} placeholder="显示名称" /></div><div className="sm:col-span-2"><Textarea value={videoModelForm.description || ''} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, description: e.target.value }))} placeholder="模型说明" /></div><Input value={videoModelForm.modelFamily} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, modelFamily: e.target.value }))} placeholder="modelFamily" /><Input value={videoModelForm.routeFamily} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, routeFamily: e.target.value }))} placeholder="routeFamily" /><Input value={videoModelForm.requestModel || ''} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, requestModel: e.target.value }))} placeholder="requestModel" /><Input type="number" step="0.1" min="0" value={String(videoModelForm.selectorCost || 0)} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, selectorCost: roundNonNegativePoint(e.target.value, 0) }))} placeholder="selectorCost" /><Input type="number" value={String(videoModelForm.maxReferenceImages || 1)} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, maxReferenceImages: Number(e.target.value || 1) }))} placeholder="最大参考图" /><Input value={videoModelForm.defaultAspectRatio || ''} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, defaultAspectRatio: e.target.value }))} placeholder="默认比例" /><Input value={videoModelForm.defaultDuration || ''} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, defaultDuration: e.target.value }))} placeholder="默认时长" /><div className="sm:col-span-2"><Input value={videoModelForm.referenceLabelsInput} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, referenceLabelsInput: e.target.value }))} placeholder="参考图标签，用逗号分隔" /></div><div className="sm:col-span-2"><Input value={videoModelForm.aspectRatioOptionsInput} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, aspectRatioOptionsInput: e.target.value }))} placeholder="比例选项，用逗号分隔" /></div><div className="sm:col-span-2"><Input value={videoModelForm.durationOptionsInput} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, durationOptionsInput: e.target.value }))} placeholder="时长选项，用逗号分隔" /></div><Input type="number" value={String(videoModelForm.sortOrder || 0)} onChange={(e) => setVideoModelForm((prev) => ({ ...prev, sortOrder: Number(e.target.value || 0) }))} placeholder="sortOrder" /><div className="sm:col-span-2 grid gap-2 sm:grid-cols-2"><Toggle checked={videoModelForm.supportsHd === true} onChange={(checked) => setVideoModelForm((prev) => ({ ...prev, supportsHd: checked }))} label="支持高清" /><Toggle checked={videoModelForm.defaultHd === true} onChange={(checked) => setVideoModelForm((prev) => ({ ...prev, defaultHd: checked }))} label="默认高清" /><Toggle checked={videoModelForm.isActive !== false} onChange={(checked) => setVideoModelForm((prev) => ({ ...prev, isActive: checked }))} label="启用" /><Toggle checked={videoModelForm.isDefaultModel === true} onChange={(checked) => setVideoModelForm((prev) => ({ ...prev, isDefaultModel: checked }))} label="默认模型" /></div></div></div> : null}
-          {editor?.kind === 'video-route' ? (
-            <div className="mt-5 space-y-4">
-              <div className="rounded-2xl border border-fuchsia-500/20 bg-fuchsia-500/10 p-4 text-sm text-fuchsia-50">
-                <div className="mb-3 flex flex-wrap gap-2">
-                  <ActionButton
-                    onClick={() => setVideoRouteForm((prev) => applyVideoRoutePreset(prev, 'openai'))}
-                    tone="primary"
-                  >
-                    OpenAI 视频异步模板
-                  </ActionButton>
-                  <ActionButton
-                    onClick={() => setVideoRouteForm((prev) => applyVideoRoutePreset(prev, 'gemini'))}
-                    tone="success"
-                  >
-                    Gemini 直连异步模板
-                  </ActionButton>
-                </div>
-                <div className="space-y-2 text-xs leading-5 text-fuchsia-100/85">
-                  <p>视频线路支持 `openai-video` 与 `gemini-native` 两种 transport。</p>
-                  <p>当前前端按异步任务流处理，请填写 `generatePath`、`taskPath`、`upstreamModel`（或开启“使用模型请求名”）。</p>
-                </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.id}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, id: e.target.value }))}
-                    placeholder="route id"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.label}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, label: e.target.value }))}
-                    placeholder="显示名称"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Textarea
-                    value={videoRouteForm.description || ''}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, description: e.target.value }))}
-                    placeholder="线路说明"
-                  />
-                </div>
-                <Input
-                  value={videoRouteForm.routeFamily}
-                  onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, routeFamily: e.target.value }))}
-                  placeholder="线路族（routeFamily）"
-                />
-                <Input
-                  value={videoRouteForm.line}
-                  onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, line: e.target.value }))}
-                  placeholder="line1 / line2"
-                />
-                <Select
-                  value={videoRouteForm.transport}
-                  onChange={(e) =>
-                    setVideoRouteForm((prev) => ({
-                      ...prev,
-                      transport: e.target.value as AdminVideoRoutePayload['transport'],
-                    }))
-                  }
-                >
-                  <option value="openai-video">openai-video</option>
-                  <option value="gemini-native">gemini-native</option>
-                </Select>
-                <Input
-                  value={videoRouteForm.baseUrl}
-                  onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
-                  placeholder="baseUrl"
-                />
-                <Input
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  value={String(videoRouteForm.pointCost || 0)}
-                  onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, pointCost: roundNonNegativePoint(e.target.value, 0) }))}
-                  placeholder="点数"
-                />
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.generatePath}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, generatePath: e.target.value }))}
-                    placeholder="generatePath"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.taskPath || ''}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, taskPath: e.target.value }))}
-                    placeholder="taskPath"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.upstreamModel || ''}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, upstreamModel: e.target.value }))}
-                    placeholder="upstreamModel"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.apiKeyEnv || ''}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, apiKeyEnv: e.target.value }))}
-                    placeholder="apiKeyEnv"
-                  />
-                </div>
-                <div className="sm:col-span-2">
-                  <Input
-                    value={videoRouteForm.apiKey || ''}
-                    onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, apiKey: e.target.value }))}
-                    placeholder="直接保存 API Key（可选）"
-                  />
-                </div>
-                <Input
-                  type="number"
-                  value={String(videoRouteForm.sortOrder || 0)}
-                  onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, sortOrder: Number(e.target.value || 0) }))}
-                  placeholder="sortOrder"
-                />
-                <div className="sm:col-span-2 grid gap-2 sm:grid-cols-2">
-                  <Toggle
-                    checked={videoRouteForm.useRequestModel === true}
-                    onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, useRequestModel: checked }))}
-                    label="使用模型请求名"
-                  />
-                  <Toggle
-                    checked={videoRouteForm.allowUserApiKeyWithoutLogin === true}
-                    onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, allowUserApiKeyWithoutLogin: checked }))}
-                    label="允许用户 API Key 免登录"
-                  />
-                  <Toggle
-                    checked={videoRouteForm.isActive !== false}
-                    onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, isActive: checked }))}
-                    label="启用"
-                  />
-                  <Toggle
-                    checked={videoRouteForm.isDefaultRoute === true}
-                    onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, isDefaultRoute: checked }))}
-                    label="默认线路"
-                  />
-                </div>
-              </div>
-            </div>
-          ) : null}
+          {editor?.kind === 'video-route' ? <div className="mt-5 space-y-4"><div className="rounded-2xl border border-fuchsia-500/20 bg-fuchsia-500/10 p-4 text-sm text-fuchsia-50"><div className="space-y-2 text-xs leading-5 text-fuchsia-100/85"><p>视频线路当前统一使用 OpenAI 兼容异步接口。</p><p>建议至少填写 `generatePath`、`taskPath`、`upstreamModel`，然后再决定是否启用旧 Key 兼容。</p></div></div><div className="grid gap-3 sm:grid-cols-2"><div className="sm:col-span-2"><Input value={videoRouteForm.id} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, id: e.target.value }))} placeholder="route id" /></div><div className="sm:col-span-2"><Input value={videoRouteForm.label} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, label: e.target.value }))} placeholder="显示名称" /></div><div className="sm:col-span-2"><Textarea value={videoRouteForm.description || ''} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, description: e.target.value }))} placeholder="线路说明" /></div><Input value={videoRouteForm.routeFamily} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, routeFamily: e.target.value }))} placeholder="线路族（routeFamily）" /><Input value={videoRouteForm.line} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, line: e.target.value }))} placeholder="line1 / line2" /><Input value={videoRouteForm.baseUrl} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, baseUrl: e.target.value }))} placeholder="baseUrl" /><Input type="number" step="0.1" min="0" value={String(videoRouteForm.pointCost || 0)} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, pointCost: roundNonNegativePoint(e.target.value, 0) }))} placeholder="点数" /><div className="sm:col-span-2"><Input value={videoRouteForm.generatePath} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, generatePath: e.target.value }))} placeholder="generatePath" /></div><div className="sm:col-span-2"><Input value={videoRouteForm.taskPath || ''} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, taskPath: e.target.value }))} placeholder="taskPath" /></div><div className="sm:col-span-2"><Input value={videoRouteForm.upstreamModel || ''} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, upstreamModel: e.target.value }))} placeholder="upstreamModel" /></div><div className="sm:col-span-2"><Input value={videoRouteForm.apiKeyEnv || ''} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, apiKeyEnv: e.target.value }))} placeholder="apiKeyEnv" /></div><div className="sm:col-span-2"><Input value={videoRouteForm.apiKey || ''} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, apiKey: e.target.value }))} placeholder="直接保存 API Key（可选）" /></div><Input type="number" value={String(videoRouteForm.sortOrder || 0)} onChange={(e) => setVideoRouteForm((prev) => ({ ...prev, sortOrder: Number(e.target.value || 0) }))} placeholder="sortOrder" /><div className="sm:col-span-2 grid gap-2 sm:grid-cols-2"><Toggle checked={videoRouteForm.useRequestModel === true} onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, useRequestModel: checked }))} label="使用模型请求名" /><Toggle checked={videoRouteForm.allowUserApiKeyWithoutLogin === true} onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, allowUserApiKeyWithoutLogin: checked }))} label="允许用户 API Key 免登录" /><Toggle checked={videoRouteForm.isActive !== false} onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, isActive: checked }))} label="启用" /><Toggle checked={videoRouteForm.isDefaultRoute === true} onChange={(checked) => setVideoRouteForm((prev) => ({ ...prev, isDefaultRoute: checked }))} label="默认线路" /></div></div></div> : null}
           {editor ? <div className="mt-5 flex items-center justify-end gap-2"><ActionButton onClick={resetEditor}>取消</ActionButton><ActionButton onClick={() => void saveEditor()} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} tone="primary" disabled={saving}>保存</ActionButton></div> : null}
         </aside>
       </div>
@@ -1643,4 +1472,3 @@ const MediaCatalogAdminPanel: React.FC<MediaCatalogAdminPanelProps> = ({ session
 };
 
 export default MediaCatalogAdminPanel;
-

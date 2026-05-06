@@ -1,5 +1,5 @@
 # Build Stage
-FROM node:18-alpine as builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 RUN npm run build
 
 # Production Stage
-FROM node:18-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 
@@ -45,6 +45,7 @@ COPY billingStore.file.cjs ./
 COPY billingStore.mysql.cjs ./
 COPY billingReportUtils.cjs ./
 COPY pointMath.cjs ./
+COPY generatedAssetService.cjs ./
 COPY generationRecordStore.cjs ./
 COPY generationRecordStore.file.cjs ./
 COPY generationRecordStore.mysql.cjs ./
@@ -55,7 +56,7 @@ COPY scripts ./scripts
 # Create runtime directories used by announcements/uploads
 RUN mkdir -p /app/uploads/announcements
 
-# Expose port
+# Expose the production port used by the existing server reverse proxy.
 EXPOSE 3355
 
 # Start the server

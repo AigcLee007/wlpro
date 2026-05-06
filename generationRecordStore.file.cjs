@@ -5,6 +5,10 @@ const { randomBytes } = require("crypto");
 const GENERATION_RECORD_FILE = path.join(__dirname, "generation-records.json");
 const GENERATION_RECORD_VERSION = 1;
 const RECORD_LIMIT = 10000;
+const RECORD_RETENTION_DAYS = Math.max(
+  1,
+  Number.parseInt(String(process.env.GENERATION_RECORD_SUCCESS_RETENTION_DAYS || "5"), 10) || 5,
+);
 
 const createDefaultStore = () => ({
   version: GENERATION_RECORD_VERSION,
@@ -58,6 +62,12 @@ const withStore = (mutator) => {
 };
 
 const cleanupStore = (store) => {
+  const cutoff = Date.now() - RECORD_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  store.records = store.records.filter((record) => {
+    const timestamp = new Date(record.createdAt || record.updatedAt || 0).getTime();
+    return !Number.isFinite(timestamp) || timestamp >= cutoff;
+  });
+
   store.records.sort((a, b) =>
     String(b.createdAt || "").localeCompare(String(a.createdAt || "")),
   );
@@ -83,10 +93,25 @@ const normalizeUiMode = (value = "canvas") => {
   return normalized === "classic" ? "classic" : "canvas";
 };
 
+const normalizeUiModeFilter = (value = "all") => {
+  const normalized = String(value || "all").trim().toLowerCase();
+  if (normalized === "canvas" || normalized === "classic") return normalized;
+  return "all";
+};
+
 const parsePositiveInt = (value, fallback = 1) => {
   const parsed = Number.parseInt(String(value ?? fallback), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return parsed > 0 ? parsed : fallback;
+};
+
+const parseCursorTimestamp = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const date = new Date(raw);
+  const timestamp = date.getTime();
+  if (!Number.isFinite(timestamp)) return null;
+  return timestamp;
 };
 
 const parseJsonMeta = (value) => {
@@ -99,11 +124,18 @@ const parseJsonMeta = (value) => {
   }
 };
 
+const normalizeStoredResultUrl = (value = "") => {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (/^data:image\//i.test(text)) return "";
+  return text;
+};
+
 const uniqueUrls = (urls = []) =>
   Array.from(
     new Set(
       (Array.isArray(urls) ? urls : [])
-        .map((item) => String(item || "").trim())
+        .map((item) => normalizeStoredResultUrl(item))
         .filter(Boolean),
     ),
   );
@@ -126,7 +158,7 @@ const publicRecord = (record = {}) => ({
   quantity: parsePositiveInt(record.quantity, 1),
   aspectRatio: String(record.aspectRatio || "").trim() || null,
   outputSize: String(record.outputSize || "").trim() || null,
-  previewUrl: String(record.previewUrl || "").trim() || null,
+  previewUrl: normalizeStoredResultUrl(record.previewUrl) || null,
   resultUrls: uniqueUrls(record.resultUrls),
   errorMessage: String(record.errorMessage || "").trim() || null,
   meta: parseJsonMeta(record.meta),
@@ -156,7 +188,7 @@ const createGenerationRecord = async (payload = {}) =>
       quantity: parsePositiveInt(payload.quantity, 1),
       aspectRatio: String(payload.aspectRatio || "").trim() || null,
       outputSize: String(payload.outputSize || "").trim() || null,
-      previewUrl: String(payload.previewUrl || "").trim() || null,
+      previewUrl: normalizeStoredResultUrl(payload.previewUrl) || null,
       resultUrls: uniqueUrls(payload.resultUrls),
       errorMessage: String(payload.errorMessage || "").trim() || null,
       meta: payload.meta || null,
@@ -208,7 +240,7 @@ const updateRecordCompletion = (record, updates = {}) => {
     record.resultUrls = resultUrls;
   }
   if (updates.previewUrl !== undefined) {
-    record.previewUrl = String(updates.previewUrl || "").trim() || null;
+    record.previewUrl = normalizeStoredResultUrl(updates.previewUrl) || null;
   } else if (resultUrls.length > 0) {
     record.previewUrl = resultUrls[0];
   }
@@ -236,32 +268,84 @@ const completeGenerationRecordByTaskId = async (taskId, updates = {}) =>
     return publicRecord(record);
   });
 
+const getGenerationRecordByTaskId = async (taskId) =>
+  withStore((store) => {
+    const normalizedTaskId = String(taskId || "").trim();
+    if (!normalizedTaskId) return null;
+    const record = store.records.find((item) => item.taskId === normalizedTaskId);
+    return record ? publicRecord(record) : null;
+  });
+
 const listGenerationRecordsForUser = async (userId, options = {}) => {
   const normalizedUserId = String(userId || "").trim();
   const mediaType = String(options.mediaType || "all").trim().toUpperCase();
   const status = String(options.status || "all").trim().toUpperCase();
+  const uiMode = normalizeUiModeFilter(options.uiMode);
+  const recentDays = Math.max(1, Math.min(30, parsePositiveInt(options.recentDays, RECORD_RETENTION_DAYS)));
+  const recentCutoff = Date.now() - recentDays * 24 * 60 * 60 * 1000;
   const page = parsePositiveInt(options.page, 1);
   const pageSize = Math.min(100, parsePositiveInt(options.pageSize, 20));
+  const sinceTimestamp = parseCursorTimestamp(options.sinceCreatedAt);
+  const sinceId = String(options.sinceId || "").trim();
 
   return withStore((store) => {
     const filtered = store.records.filter((record) => {
       if (String(record.userId || "").trim() !== normalizedUserId) return false;
+      const createdTimestamp = parseCursorTimestamp(record.createdAt || record.updatedAt);
+      if (createdTimestamp !== null && createdTimestamp < recentCutoff) return false;
       if (mediaType !== "ALL" && normalizeMediaType(record.mediaType) !== mediaType) {
         return false;
       }
       if (status !== "ALL" && normalizeStatus(record.status) !== status) {
         return false;
       }
+      if (uiMode !== "all" && normalizeUiMode(record.uiMode) !== uiMode) {
+        return false;
+      }
+      if (sinceTimestamp !== null) {
+        const recordTimestamp = parseCursorTimestamp(record.createdAt);
+        if (recordTimestamp === null) return false;
+        if (recordTimestamp < sinceTimestamp) return false;
+        if (recordTimestamp === sinceTimestamp && sinceId && String(record.id || "") === sinceId) {
+          return false;
+        }
+      }
       return true;
     });
 
-    const total = filtered.length;
+    const sorted = filtered.sort((a, b) =>
+      String(b.createdAt || "").localeCompare(String(a.createdAt || "")),
+    );
+
+    if (sinceTimestamp !== null) {
+      const records = sorted
+        .slice(0, pageSize)
+        .map((record) => publicRecord(record));
+      const cursorRecord = records[0] || null;
+      return {
+        total: records.length,
+        page: 1,
+        pageSize,
+        totalPages: 1,
+        records,
+        incremental: true,
+        cursor: cursorRecord
+          ? {
+              sinceCreatedAt: cursorRecord.createdAt,
+              sinceId: cursorRecord.id,
+            }
+          : null,
+      };
+    }
+
+    const total = sorted.length;
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const safePage = Math.min(page, totalPages);
     const start = (safePage - 1) * pageSize;
-    const items = filtered
+    const items = sorted
       .slice(start, start + pageSize)
       .map((record) => publicRecord(record));
+    const cursorRecord = items[0] || null;
 
     return {
       total,
@@ -269,6 +353,12 @@ const listGenerationRecordsForUser = async (userId, options = {}) => {
       pageSize,
       totalPages,
       records: items,
+      cursor: cursorRecord
+        ? {
+            sinceCreatedAt: cursorRecord.createdAt,
+            sinceId: cursorRecord.id,
+          }
+        : null,
     };
   });
 };
@@ -276,13 +366,15 @@ const listGenerationRecordsForUser = async (userId, options = {}) => {
 const clearGenerationRecordsForUser = async (userId, options = {}) => {
   const normalizedUserId = String(userId || "").trim();
   const mediaType = String(options.mediaType || "all").trim().toUpperCase();
+  const uiMode = normalizeUiModeFilter(options.uiMode);
 
   return withStore((store) => {
     const before = store.records.length;
     store.records = store.records.filter((record) => {
       if (String(record.userId || "").trim() !== normalizedUserId) return true;
-      if (mediaType === "ALL") return false;
-      return normalizeMediaType(record.mediaType) !== mediaType;
+      if (mediaType !== "ALL" && normalizeMediaType(record.mediaType) !== mediaType) return true;
+      if (uiMode !== "all" && normalizeUiMode(record.uiMode) !== uiMode) return true;
+      return false;
     });
     return {
       removed: before - store.records.length,
@@ -290,11 +382,28 @@ const clearGenerationRecordsForUser = async (userId, options = {}) => {
   });
 };
 
+const cleanupExpiredGenerationRecords = async () =>
+  withStore((store) => {
+    const before = store.records.length;
+    cleanupStore(store);
+    return {
+      removed: before - store.records.length,
+      successRetentionDays: RECORD_RETENTION_DAYS,
+      failedRetentionDays: RECORD_RETENTION_DAYS,
+      pendingRetentionDays: RECORD_RETENTION_DAYS,
+    };
+  });
+
+const startGenerationRecordMaintenance = () => null;
+
 module.exports = {
   attachTaskToGenerationRecord,
   clearGenerationRecordsForUser,
+  cleanupExpiredGenerationRecords,
   completeGenerationRecord,
   completeGenerationRecordByTaskId,
   createGenerationRecord,
+  getGenerationRecordByTaskId,
   listGenerationRecordsForUser,
+  startGenerationRecordMaintenance,
 };

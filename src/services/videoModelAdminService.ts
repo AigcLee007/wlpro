@@ -1,4 +1,4 @@
-import { getAuthorizedBillingHeaders } from './accountIdentity';
+﻿import { getAuthorizedBillingHeaders } from './accountIdentity';
 import {
   refreshVideoModelCatalog,
   type VideoModelCatalogShape,
@@ -7,7 +7,7 @@ import {
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -104,3 +104,4 @@ export const deleteAdminVideoModel = async (
   await refreshVideoModelCatalog().catch(() => undefined);
   return data;
 };
+

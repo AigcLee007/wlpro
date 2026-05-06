@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+﻿import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Boxes,
@@ -162,14 +162,14 @@ const AdminDashboardPage: React.FC = () => {
 
   if (!session?.authenticated) {
     return (
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.12),_transparent_35%),linear-gradient(180deg,#020617,#0f172a)] px-4 py-10 text-white">
+      <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(14,165,233,0.16),_transparent_35%),linear-gradient(180deg,#020617,#0f172a)] px-4 py-10 text-white">
         <div className="mx-auto max-w-5xl">
           <div className="mb-6 flex items-center justify-between gap-4">
             <div>
-              <div className="text-xs uppercase tracking-[0.22em] text-cyan-300">Admin Portal</div>
-              <h1 className="mt-2 text-3xl font-semibold">网站管理后台</h1>
+              <div className="text-xs uppercase tracking-[0.22em] text-sky-300">Wuling Admin</div>
+              <h1 className="mt-2 text-3xl font-semibold">武陵商厦管理后台</h1>
               <p className="mt-2 text-sm text-gray-400">
-                先登录管理员账号，再进入运行总览、用户管理和公告管理。超级管理员额外拥有模型线路与点数配置权限。
+                请先登录管理员账号，再查看运行总览、用户管理、公告管理、模型线路和点数配置。
               </p>
             </div>
             <button
@@ -211,10 +211,10 @@ const AdminDashboardPage: React.FC = () => {
       <div className="mx-auto flex min-h-screen max-w-[1700px] gap-6 px-4 py-6 xl:px-6">
         <aside className="hidden w-[280px] shrink-0 xl:block">
           <div className="sticky top-6 rounded-[28px] border border-white/10 bg-white/[0.04] p-5 shadow-[0_18px_60px_rgba(0,0,0,0.32)]">
-            <div className="text-xs uppercase tracking-[0.22em] text-cyan-300">Admin Portal</div>
-            <div className="mt-3 text-2xl font-semibold text-white">网站管理后台</div>
+            <div className="text-xs uppercase tracking-[0.22em] text-sky-300">Wuling Admin</div>
+            <div className="mt-3 text-2xl font-semibold text-white">武陵商厦管理后台</div>
             <div className="mt-2 text-sm leading-6 text-gray-400">
-              普通管理员可查看站点运行、用户消费并发布公告；超级管理员额外拥有模型线路和点数配置权限。
+              普通管理员可查看运行、管理用户并发布公告；超级管理员可维护模型线路和点数配置。
             </div>
 
             <div className="mt-6 rounded-2xl border border-white/10 bg-black/20 p-4">
@@ -238,8 +238,8 @@ const AdminDashboardPage: React.FC = () => {
                     onClick={() => setActiveSection(section.id)}
                     className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm transition-colors ${
                       active
-                        ? 'bg-cyan-500/15 text-white'
-                        : 'text-gray-300 hover:bg-white/6 hover:text-white'
+                        ? 'bg-sky-500/15 text-white'
+                        : 'text-gray-300 hover:bg-white/10 hover:text-white'
                     }`}
                   >
                     <Icon size={16} />
@@ -264,37 +264,40 @@ const AdminDashboardPage: React.FC = () => {
 
         <main className="min-w-0 flex-1">
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 xl:hidden">
+            <div>
+              <div className="text-xs uppercase tracking-[0.22em] text-sky-300">Wuling Admin</div>
+              <div className="mt-1 text-2xl font-semibold text-white">武陵商厦管理后台</div>
+            </div>
             <button
               type="button"
               onClick={() => {
                 window.location.href = '/';
               }}
-              className="inline-flex h-10 items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 text-sm text-white hover:bg-white/10"
+              className="inline-flex h-11 items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 text-sm text-white hover:bg-white/10"
             >
               <ArrowLeft size={15} />
               返回创作页
             </button>
-            <div className="flex flex-wrap gap-2">
-              {sections.map((section) => {
-                const Icon = section.icon;
-                const active = activeSection === section.id;
-                return (
-                  <button
-                    key={section.id}
-                    type="button"
-                    onClick={() => setActiveSection(section.id)}
-                    className={`inline-flex h-10 items-center gap-2 rounded-2xl border px-4 text-sm ${
-                      active
-                        ? 'border-cyan-400/30 bg-cyan-400/10 text-white'
-                        : 'border-white/10 bg-white/5 text-gray-300'
-                    }`}
-                  >
-                    <Icon size={15} />
-                    {section.label}
-                  </button>
-                );
-              })}
-            </div>
+          </div>
+
+          <div className="mb-5 flex gap-2 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-2 xl:hidden">
+            {sections.map((section) => {
+              const Icon = section.icon;
+              const active = activeSection === section.id;
+              return (
+                <button
+                  key={section.id}
+                  type="button"
+                  onClick={() => setActiveSection(section.id)}
+                  className={`inline-flex h-10 shrink-0 items-center gap-2 rounded-xl px-3 text-sm ${
+                    active ? 'bg-sky-500/20 text-white' : 'text-gray-300'
+                  }`}
+                >
+                  <Icon size={15} />
+                  {section.label}
+                </button>
+              );
+            })}
           </div>
 
           {renderContent()}

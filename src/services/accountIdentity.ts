@@ -1,17 +1,8 @@
-const API_BASE_URL =
-  typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
-    : '/api';
+﻿const API_BASE_URL =
+  '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 const STORAGE_KEY = 'auth-session-v1';
-const LEGACY_STORAGE_KEYS = [
-  'auth-session',
-  'auth-session-token',
-  'authSession',
-  'sessionToken',
-  'x-auth-session',
-];
 export const AUTH_SESSION_CHANGE_EVENT = 'auth-session-change';
 
 export type AuthUserRole = 'user' | 'admin' | 'super_admin';
@@ -29,6 +20,8 @@ export interface AuthUserProfile {
   createdAt: string;
   updatedAt: string;
   lastLoginAt: string | null;
+  lastSeenAt?: string | null;
+  isOnline?: boolean;
 }
 
 export interface AuthSessionPayload {
@@ -55,39 +48,6 @@ export interface RegistrationStatusPayload {
 const canUseStorage = () =>
   typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
 
-const canUseSessionStorage = () =>
-  typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined';
-
-const canUseDocumentCookie = () =>
-  typeof document !== 'undefined' && typeof document.cookie === 'string';
-
-const getCookieValue = (name: string): string | null => {
-  if (!canUseDocumentCookie()) return null;
-  const prefix = `${encodeURIComponent(name)}=`;
-  const item = document.cookie
-    .split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(prefix));
-  if (!item) return null;
-  const value = item.slice(prefix.length);
-  return value ? decodeURIComponent(value) : null;
-};
-
-const setSessionCookie = (sessionToken: string) => {
-  if (!canUseDocumentCookie()) return;
-  const maxAge = 30 * 24 * 60 * 60;
-  document.cookie = `${encodeURIComponent(STORAGE_KEY)}=${encodeURIComponent(
-    sessionToken,
-  )}; Path=/; Max-Age=${maxAge}; SameSite=Lax`;
-};
-
-const clearSessionCookie = () => {
-  if (!canUseDocumentCookie()) return;
-  document.cookie = `${encodeURIComponent(
-    STORAGE_KEY,
-  )}=; Path=/; Max-Age=0; SameSite=Lax`;
-};
-
 const emitAuthSessionChange = () => {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new Event(AUTH_SESSION_CHANGE_EVENT));
@@ -108,53 +68,18 @@ const parseResponse = async <T>(response: Response): Promise<T> => {
 export const getStoredAuthSessionToken = (): string | null => {
   if (!canUseStorage()) return null;
   const raw = window.localStorage.getItem(STORAGE_KEY);
-  if (raw && raw.trim()) return raw.trim();
-
-  // Backward compatibility: auto-migrate legacy session key names.
-  for (const key of LEGACY_STORAGE_KEYS) {
-    const legacyValue = window.localStorage.getItem(key);
-    if (legacyValue && legacyValue.trim()) {
-      const normalized = legacyValue.trim();
-      window.localStorage.setItem(STORAGE_KEY, normalized);
-      setSessionCookie(normalized);
-      return normalized;
-    }
-  }
-
-  // Additional fallback: some historical builds used sessionStorage.
-  if (canUseSessionStorage()) {
-    for (const key of [STORAGE_KEY, ...LEGACY_STORAGE_KEYS]) {
-      const sessionValue = window.sessionStorage.getItem(key);
-      if (sessionValue && sessionValue.trim()) {
-        const normalized = sessionValue.trim();
-        window.localStorage.setItem(STORAGE_KEY, normalized);
-        setSessionCookie(normalized);
-        return normalized;
-      }
-    }
-  }
-
-  const cookieValue = getCookieValue(STORAGE_KEY);
-  if (cookieValue && cookieValue.trim()) {
-    const normalized = cookieValue.trim();
-    window.localStorage.setItem(STORAGE_KEY, normalized);
-    return normalized;
-  }
-
-  return null;
+  return raw && raw.trim() ? raw.trim() : null;
 };
 
 export const setStoredAuthSessionToken = (sessionToken: string) => {
   if (!canUseStorage()) return;
   window.localStorage.setItem(STORAGE_KEY, sessionToken);
-  setSessionCookie(sessionToken);
   emitAuthSessionChange();
 };
 
 export const clearStoredAuthSessionToken = () => {
   if (!canUseStorage()) return;
   window.localStorage.removeItem(STORAGE_KEY);
-  clearSessionCookie();
   emitAuthSessionChange();
 };
 
@@ -167,7 +92,7 @@ export const buildBillingIdentityHeaders = (
 export const getAuthorizedBillingHeaders = async (): Promise<Record<string, string>> => {
   const sessionToken = getStoredAuthSessionToken();
   if (!sessionToken) {
-    throw new Error('请先登录后再使用点数功能');
+    throw new Error('璇峰厛鐧诲綍鍚庡啀浣跨敤鐐规暟鍔熻兘');
   }
   return buildBillingIdentityHeaders(sessionToken);
 };
@@ -209,12 +134,12 @@ export const ensureBillingIdentity = async (): Promise<{
 }> => {
   const sessionToken = getStoredAuthSessionToken();
   if (!sessionToken) {
-    throw new Error('请先登录后再使用点数功能');
+    throw new Error('璇峰厛鐧诲綍鍚庡啀浣跨敤鐐规暟鍔熻兘');
   }
 
   const current = await fetchCurrentAuthSession();
   if (!current?.authenticated || !current.user) {
-    throw new Error('登录状态已失效，请重新登录');
+    throw new Error('鐧诲綍鐘舵€佸凡澶辨晥锛岃閲嶆柊鐧诲綍');
   }
 
   return {
@@ -438,7 +363,7 @@ export const changeCurrentUserPassword = async ({
 }): Promise<AuthUserProfile> => {
   const sessionToken = getStoredAuthSessionToken();
   if (!sessionToken) {
-    throw new Error('请先登录后再修改密码');
+    throw new Error('璇峰厛鐧诲綍鍚庡啀淇敼瀵嗙爜');
   }
 
   const response = await fetch(`${cleanUrl(API_BASE_URL)}/auth/password/change`, {
@@ -457,3 +382,4 @@ export const changeCurrentUserPassword = async ({
 
   return data.user;
 };
+

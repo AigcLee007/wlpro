@@ -26,12 +26,10 @@ const {
   logoutSession,
   registerWithPassword,
   resetPasswordWithEmailCode,
-  resetAdminManagedUserPassword,
   requestEmailCode,
   requireAdminAccess,
   requireAuthUser,
   requireSuperAdminAccess,
-  setAdminManagedUserStatus,
   setUserPassword,
   updateAdminUser,
   verifyEmailCode,
@@ -50,13 +48,14 @@ const {
   requireBillingAccount,
   getAccountSummary,
   getBillingPricing,
+  listPendingTasks,
   listRedeemCodes,
   reservePoints,
   redeemCode,
   refundPoints,
   registerPendingTask,
-  scanAndCompensateAbnormalOrders,
   settlePendingTask,
+  startBillingMaintenance,
   rechargeAccount,
 } = require("./billingStore.cjs");
 const {
@@ -65,7 +64,9 @@ const {
   completeGenerationRecord,
   completeGenerationRecordByTaskId,
   createGenerationRecord,
+  getGenerationRecordByTaskId,
   listGenerationRecordsForUser,
+  startGenerationRecordMaintenance,
 } = require("./generationRecordStore.cjs");
 const {
   createManagedImageRoute,
@@ -106,6 +107,10 @@ const {
   listAdminChanges,
   recordAdminChange,
 } = require("./adminChangeLogStore.cjs");
+const {
+  persistGeneratedImageResults,
+  LINE4_LOCAL_STORAGE_ROOT,
+} = require("./generatedAssetService.cjs");
 const { toPointNumber } = require("./pointMath.cjs");
 
 // Logger Configuration
@@ -124,6 +129,8 @@ const logger = winston.createLogger({
 const app = express();
 const PORT = Number.parseInt(String(process.env.PORT || "3355"), 10);
 const UPSTREAM_URL = "https://api.bltcy.ai";
+const TRUST_PROXY_HOPS = Number.parseInt(String(process.env.TRUST_PROXY_HOPS || "1"), 10);
+app.set("trust proxy", Number.isFinite(TRUST_PROXY_HOPS) && TRUST_PROXY_HOPS > 0 ? TRUST_PROXY_HOPS : 1);
 
 // Default upstream kept for balance, video, and prompt helper endpoints.
 const SHARED_HTTPS_AGENT = new https.Agent({
@@ -205,11 +212,25 @@ const toPublicImageRouteSizeOverrides = (overrides) => {
 
   return Object.entries(overrides).reduce((accumulator, [rawKey, rawValue]) => {
     const key = String(rawKey || "").trim().toLowerCase();
-    const pointCost = toPointNumber(rawValue?.pointCost ?? "", 0);
-    if (!["1k", "2k", "4k"].includes(key) || !Number.isFinite(pointCost) || pointCost < 0) {
+    const upstreamModel = String(rawValue?.upstreamModel || "").trim();
+    const hasPointCost =
+      rawValue?.pointCost !== undefined &&
+      rawValue?.pointCost !== null &&
+      rawValue?.pointCost !== "";
+    const pointCost = hasPointCost ? toPointNumber(rawValue.pointCost, 0) : null;
+    if (!["1k", "2k", "4k"].includes(key)) {
       return accumulator;
     }
-    accumulator[key] = { pointCost };
+    const entry = {};
+    if (upstreamModel) {
+      entry.upstreamModel = upstreamModel;
+    }
+    if (hasPointCost && Number.isFinite(pointCost) && pointCost >= 0) {
+      entry.pointCost = pointCost;
+    }
+    if (entry.upstreamModel || Number.isFinite(entry.pointCost)) {
+      accumulator[key] = entry;
+    }
     return accumulator;
   }, {});
 };
@@ -277,16 +298,6 @@ const applyRoutePathTemplate = (template, params = {}) =>
   String(template || "").replace(/\{(\w+)\}/g, (_, key) =>
     encodeURIComponent(params[key] ?? ""),
   );
-const getCookieValue = (cookieHeader, name) => {
-  const target = `${encodeURIComponent(name)}=`;
-  return (
-    String(cookieHeader || "")
-      .split(";")
-      .map((part) => part.trim())
-      .find((part) => part.startsWith(target))
-      ?.slice(target.length) || ""
-  );
-};
 const buildRouteUrl = (route, template, params = {}) =>
   `${trimTrailingSlash(route.baseUrl)}${applyRoutePathTemplate(template, params)}`;
 const buildImageTaskToken = (routeId, upstreamTaskId) =>
@@ -329,20 +340,10 @@ const fetchVisionaryRecordById = async ({
     { retries: 1, delayMs: 250, label: `visionary-list-query-${route.id}` },
   );
 
-  const payload = response?.data;
-  const records = Array.isArray(payload?.data)
-    ? payload.data
-    : Array.isArray(payload?.results)
-      ? payload.results
-      : Array.isArray(payload?.items)
-        ? payload.items
-        : Array.isArray(payload)
-          ? payload
-          : [];
+  const records = Array.isArray(response?.data?.data) ? response.data.data : [];
   return (
     records.find(
-      (item) =>
-        String(item?.id || "").trim() === String(upstreamTaskId || "").trim(),
+      (item) => String(item?.id || "").trim() === String(upstreamTaskId || "").trim(),
     ) || null
   );
 };
@@ -366,6 +367,15 @@ const scheduleLocalImageJobCleanup = (jobId) => {
   setTimeout(() => {
     LOCAL_IMAGE_JOBS.delete(jobId);
   }, LOCAL_IMAGE_JOB_TTL_MS).unref?.();
+};
+const toImmediateImagePayload = (payload) => {
+  const resultUrls = extractResultUrlsFromPayload(payload);
+  return {
+    ...payload,
+    url: payload?.url || payload?.image_url || resultUrls[0] || null,
+    image_url: payload?.image_url || payload?.url || resultUrls[0] || null,
+    images: Array.isArray(payload?.images) ? payload.images : resultUrls,
+  };
 };
 const createGeminiDataItems = (images = []) =>
   images.map((value) => {
@@ -440,94 +450,6 @@ const ensureDataUriImage = (value) => {
   if (!looksLikeBase64Image(compact)) return trimmed;
   const mimeType = guessDataUriMimeType(compact);
   return `data:${mimeType};base64,${compact}`;
-};
-const toGeminiPartFromImage = (value) => {
-  if (typeof value !== "string") return null;
-  const normalized = ensureDataUriImage(value);
-  if (typeof normalized !== "string") return null;
-  const trimmed = normalized.trim();
-  if (!trimmed) return null;
-
-  if (/^data:image\//i.test(trimmed)) {
-    const match = trimmed.match(/^data:(image\/[^;]+);base64,(.+)$/i);
-    if (match) {
-      return {
-        inlineData: {
-          mimeType: match[1],
-          data: match[2],
-        },
-      };
-    }
-  }
-
-  if (/^https?:\/\//i.test(trimmed)) {
-    return {
-      fileData: {
-        mimeType: "image/jpeg",
-        fileUri: trimmed,
-      },
-    };
-  }
-
-  const compact = trimmed.replace(/\s+/g, "");
-  if (looksLikeBase64Image(compact)) {
-    return {
-      inlineData: {
-        mimeType: guessDataUriMimeType(compact),
-        data: compact,
-      },
-    };
-  }
-
-  return null;
-};
-const buildGeminiNativeVideoBody = (requestBody = {}) => {
-  const prompt = String(requestBody?.prompt || "").trim();
-  const parts = [];
-  if (prompt) {
-    parts.push({ text: prompt });
-  }
-
-  const appended = new Set();
-  const appendImage = (value) => {
-    if (Array.isArray(value)) {
-      value.forEach((item) => appendImage(item));
-      return;
-    }
-    const part = toGeminiPartFromImage(value);
-    if (!part) return;
-    const fingerprint = JSON.stringify(part);
-    if (appended.has(fingerprint)) return;
-    appended.add(fingerprint);
-    parts.push(part);
-  };
-
-  appendImage(requestBody.image);
-  appendImage(requestBody.last_frame);
-  appendImage(requestBody.images);
-
-  if (parts.length === 0) {
-    parts.push({ text: prompt || "Generate video" });
-  }
-
-  const aspectRatio =
-    requestBody.aspect_ratio ||
-    requestBody.ratio ||
-    requestBody.input_config?.aspect_ratio ||
-    "16:9";
-
-  const body = {
-    contents: [{ parts }],
-    generationConfig: {
-      responseModalities: ["VIDEO", "TEXT"],
-    },
-  };
-
-  if (aspectRatio) {
-    body.generationConfig.aspectRatio = String(aspectRatio);
-  }
-
-  return body;
 };
 const applyVisionaryImageCompat = (requestBody = {}) => {
   const normalizeArray = (value) => {
@@ -617,7 +539,13 @@ const logAdminCatalogChange = async (req, change) => {
   }
 };
 const buildAdminUserListPayload = async (result) => {
-  const userIds = (result?.users || []).map((user) => user.userId);
+  const userIds = Array.from(
+    new Set(
+      [...(result?.users || []), ...(result?.onlineUsers || [])]
+        .map((user) => user.userId)
+        .filter(Boolean),
+    ),
+  );
   const accountMap = await getAccountsByUserIds(userIds);
   return {
     success: true,
@@ -625,6 +553,12 @@ const buildAdminUserListPayload = async (result) => {
     page: Number(result?.page || 1),
     pageSize: Number(result?.pageSize || userIds.length || 20),
     totalPages: Number(result?.totalPages || 1),
+    onlineTotal: Number(result?.onlineTotal || 0),
+    onlineWindowMinutes: Number(result?.onlineWindowMinutes || 5),
+    onlineUsers: (result?.onlineUsers || []).map((user) => ({
+      ...user,
+      account: accountMap[user.userId] || null,
+    })),
     users: (result?.users || []).map((user) => ({
       ...user,
       account: accountMap[user.userId] || null,
@@ -686,6 +620,13 @@ const mergeAdminRouteRuntimeStats = (catalog, stats = []) => {
       requestsLast24h: 0,
       successfulLast24h: 0,
       failedLast24h: 0,
+      requestsLast30m: 0,
+      successfulLast30m: 0,
+      failedLast30m: 0,
+      grossChargePointsLast30m: 0,
+      refundedPointsLast30m: 0,
+      netSpentPointsLast30m: 0,
+      successRateLast30m: 0,
       successRate: 0,
       successRateLast24h: 0,
       lastChargeAt: null,
@@ -718,6 +659,13 @@ const mergeAdminRouteRuntimeStats = (catalog, stats = []) => {
       requestsLast24h: 0,
       successfulLast24h: 0,
       failedLast24h: 0,
+      requestsLast30m: 0,
+      successfulLast30m: 0,
+      failedLast30m: 0,
+      grossChargePointsLast30m: 0,
+      refundedPointsLast30m: 0,
+      netSpentPointsLast30m: 0,
+      successRateLast30m: 0,
       successRate: 0,
       successRateLast24h: 0,
       lastChargeAt: null,
@@ -778,6 +726,13 @@ const mergeAdminModelRuntimeStats = (catalog, stats = []) => {
       requestsLast24h: 0,
       successfulLast24h: 0,
       failedLast24h: 0,
+      requestsLast30m: 0,
+      successfulLast30m: 0,
+      failedLast30m: 0,
+      grossChargePointsLast30m: 0,
+      refundedPointsLast30m: 0,
+      netSpentPointsLast30m: 0,
+      successRateLast30m: 0,
       successRate: 0,
       successRateLast24h: 0,
       lastChargeAt: null,
@@ -811,6 +766,13 @@ const mergeAdminModelRuntimeStats = (catalog, stats = []) => {
       requestsLast24h: 0,
       successfulLast24h: 0,
       failedLast24h: 0,
+      requestsLast30m: 0,
+      successfulLast30m: 0,
+      failedLast30m: 0,
+      grossChargePointsLast30m: 0,
+      refundedPointsLast30m: 0,
+      netSpentPointsLast30m: 0,
+      successRateLast30m: 0,
       successRate: 0,
       successRateLast24h: 0,
       lastChargeAt: null,
@@ -844,59 +806,21 @@ const buildAdminDashboardPayload = async () => {
     getAdminBillingOverview({
       recentWindowHours: 24,
     }),
-    getImageRouteCatalog(),
-    getImageModelCatalog(),
-    getVideoRouteCatalog(),
-    getVideoModelCatalog(),
+    getImageRouteCatalog({ includeInactive: true }),
+    getImageModelCatalog({ includeInactive: true }),
+    getVideoRouteCatalog({ includeInactive: true }),
+    getVideoModelCatalog({ includeInactive: true }),
   ]);
 
-  const visibleImageRouteFamilies = new Set(
-    (imageModelCatalog?.models || [])
-      .filter((model) => model?.isActive !== false)
-      .map((model) => String(model?.routeFamily || "").trim())
-      .filter(Boolean),
-  );
-  const visibleVideoRouteFamilies = new Set(
-    (videoModelCatalog?.models || [])
-      .filter((model) => model?.isActive !== false)
-      .map((model) => String(model?.routeFamily || "").trim())
-      .filter(Boolean),
-  );
-  const visibleImageRoutes = (imageRouteCatalog?.routes || []).filter((route) =>
-    visibleImageRouteFamilies.has(String(route?.modelFamily || "").trim()),
-  );
-  const visibleVideoRoutes = (videoRouteCatalog?.routes || []).filter((route) =>
-    visibleVideoRouteFamilies.has(String(route?.routeFamily || "").trim()),
-  );
-  const visibleImageRouteFamilySet = new Set(
-    visibleImageRoutes.map((route) => String(route?.modelFamily || "").trim()).filter(Boolean),
-  );
-  const visibleVideoRouteFamilySet = new Set(
-    visibleVideoRoutes.map((route) => String(route?.routeFamily || "").trim()).filter(Boolean),
-  );
-  const visibleImageModels = (imageModelCatalog?.models || []).filter((model) => {
-    if (model?.isActive === false) return false;
-    const routeFamily = String(model?.routeFamily || "").trim();
-    return routeFamily ? visibleImageRouteFamilySet.has(routeFamily) : true;
-  });
-  const visibleVideoModels = (videoModelCatalog?.models || []).filter((model) => {
-    if (model?.isActive === false) return false;
-    const routeFamily = String(model?.routeFamily || "").trim();
-    return routeFamily ? visibleVideoRouteFamilySet.has(routeFamily) : false;
-  });
-
   const combinedRouteCatalog = {
-    defaultRouteId:
-      visibleImageRoutes.find((route) => route?.isDefaultRoute === true)?.id ||
-      visibleImageRoutes[0]?.id ||
-      "",
+    defaultRouteId: imageRouteCatalog?.defaultRouteId || "",
     defaultNanoBananaLine: imageRouteCatalog?.defaultNanoBananaLine || "",
     routes: [
-      ...(visibleImageRoutes.map((route) => ({
+      ...((imageRouteCatalog?.routes || []).map((route) => ({
         ...route,
         mediaType: "image",
       }))),
-      ...(visibleVideoRoutes.map((route) => ({
+      ...((videoRouteCatalog?.routes || []).map((route) => ({
         ...route,
         modelFamily: route.routeFamily,
         mediaType: "video",
@@ -905,16 +829,13 @@ const buildAdminDashboardPayload = async () => {
     ],
   };
   const combinedModelCatalog = {
-    defaultModelId:
-      visibleImageModels.find((model) => model?.isDefaultModel === true)?.id ||
-      visibleImageModels[0]?.id ||
-      "",
+    defaultModelId: imageModelCatalog?.defaultModelId || "",
     models: [
-      ...(visibleImageModels.map((model) => ({
+      ...((imageModelCatalog?.models || []).map((model) => ({
         ...model,
         mediaType: "image",
       }))),
-      ...(visibleVideoModels.map((model) => ({
+      ...((videoModelCatalog?.models || []).map((model) => ({
         ...model,
         mediaType: "video",
         panelLayout: "video",
@@ -923,36 +844,13 @@ const buildAdminDashboardPayload = async () => {
     ],
   };
 
-  const visibleRouteIds = new Set(
-    (combinedRouteCatalog.routes || []).map((route) => String(route?.id || "").trim()),
-  );
-  const visibleModelIds = new Set(
-    (combinedModelCatalog.models || []).map((model) => String(model?.id || "").trim()),
-  );
-  const visibleModelRequestNames = new Set(
-    (combinedModelCatalog.models || [])
-      .map((model) => String(model?.requestModel || "").trim())
-      .filter(Boolean),
-  );
-  const filteredRouteRuntimeStats = (billingOverview?.routeStats || []).filter((item) =>
-    visibleRouteIds.has(String(item?.routeId || "").trim()),
-  );
-  const filteredModelRuntimeStats = (billingOverview?.modelStats || []).filter((item) => {
-    const modelId = String(item?.modelId || "").trim();
-    const requestModel = String(item?.requestModel || "").trim();
-    return (
-      (modelId && visibleModelIds.has(modelId)) ||
-      (requestModel && visibleModelRequestNames.has(requestModel))
-    );
-  });
-
   const routeStats = mergeAdminRouteRuntimeStats(
     combinedRouteCatalog,
-    filteredRouteRuntimeStats,
+    billingOverview?.routeStats || [],
   );
   const modelStats = mergeAdminModelRuntimeStats(
     combinedModelCatalog,
-    filteredModelRuntimeStats,
+    billingOverview?.modelStats || [],
   );
   const imageRouteStats = routeStats.filter((item) => item.mediaType === "image");
   const videoRouteStats = routeStats.filter((item) => item.mediaType === "video");
@@ -970,23 +868,31 @@ const buildAdminDashboardPayload = async () => {
     auth: authOverview,
     billing: billingOverview?.overall || null,
     routeCatalog: {
-      defaultRouteId: combinedRouteCatalog.defaultRouteId,
+      defaultRouteId: imageRouteCatalog?.defaultRouteId || "",
       defaultNanoBananaLine: imageRouteCatalog?.defaultNanoBananaLine || "",
       totalRoutes: combinedRouteCatalog.routes.length,
       activeRoutes: combinedRouteCatalog.routes.filter((route) => route.isActive !== false).length,
-      imageTotalRoutes: visibleImageRoutes.length,
-      imageActiveRoutes: visibleImageRoutes.filter((route) => route.isActive !== false).length,
-      videoTotalRoutes: visibleVideoRoutes.length,
-      videoActiveRoutes: visibleVideoRoutes.filter((route) => route.isActive !== false).length,
+      imageTotalRoutes: Array.isArray(imageRouteCatalog?.routes) ? imageRouteCatalog.routes.length : 0,
+      imageActiveRoutes: Array.isArray(imageRouteCatalog?.routes)
+        ? imageRouteCatalog.routes.filter((route) => route.isActive !== false).length
+        : 0,
+      videoTotalRoutes: Array.isArray(videoRouteCatalog?.routes) ? videoRouteCatalog.routes.length : 0,
+      videoActiveRoutes: Array.isArray(videoRouteCatalog?.routes)
+        ? videoRouteCatalog.routes.filter((route) => route.isActive !== false).length
+        : 0,
     },
     modelCatalog: {
-      defaultModelId: combinedModelCatalog.defaultModelId,
+      defaultModelId: imageModelCatalog?.defaultModelId || "",
       totalModels: combinedModelCatalog.models.length,
       activeModels: combinedModelCatalog.models.filter((model) => model.isActive !== false).length,
-      imageTotalModels: visibleImageModels.length,
-      imageActiveModels: visibleImageModels.filter((model) => model.isActive !== false).length,
-      videoTotalModels: visibleVideoModels.length,
-      videoActiveModels: visibleVideoModels.filter((model) => model.isActive !== false).length,
+      imageTotalModels: Array.isArray(imageModelCatalog?.models) ? imageModelCatalog.models.length : 0,
+      imageActiveModels: Array.isArray(imageModelCatalog?.models)
+        ? imageModelCatalog.models.filter((model) => model.isActive !== false).length
+        : 0,
+      videoTotalModels: Array.isArray(videoModelCatalog?.models) ? videoModelCatalog.models.length : 0,
+      videoActiveModels: Array.isArray(videoModelCatalog?.models)
+        ? videoModelCatalog.models.filter((model) => model.isActive !== false).length
+        : 0,
     },
     routeStats,
     modelStats,
@@ -998,11 +904,11 @@ const buildAdminDashboardPayload = async () => {
 };
 const sendBillingError = (res, error) => {
   if (error instanceof BillingError) {
-    const isAuthError =
-      error.code === "ACCOUNT_AUTH_REQUIRED" || error.code === "AUTH_LOGIN_REQUIRED";
-    return res.status(isAuthError ? 401 : 400).json({
-      error: error.message,
-      code: error.code,
+    const normalized = normalizeGenerationError(error, 400);
+    return res.status(normalized.status).json({
+      error: normalized.error,
+      code: normalized.code,
+      status: normalized.status,
       currentPoints: error.currentPoints,
       requiredPoints: error.requiredPoints,
     });
@@ -1036,17 +942,21 @@ const dedupeResultUrls = (urls = []) =>
         .filter(Boolean),
     ),
   );
+const isUsableResultUrl = (value = "") => {
+  const trimmed = String(value || "").trim();
+  return (
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://") ||
+    trimmed.startsWith("data:") ||
+    trimmed.startsWith("/")
+  );
+};
 const collectResultUrls = (value, bucket = []) => {
   if (!value) return bucket;
 
   if (typeof value === "string") {
     const trimmed = value.trim();
-    if (
-      trimmed.startsWith("http://") ||
-      trimmed.startsWith("https://") ||
-      trimmed.startsWith("data:") ||
-      trimmed.startsWith("/")
-    ) {
+    if (isUsableResultUrl(trimmed)) {
       bucket.push(trimmed);
     }
     return bucket;
@@ -1061,20 +971,21 @@ const collectResultUrls = (value, bucket = []) => {
 
   [
     "url",
-    "uri",
     "output",
     "image_url",
     "imageUrl",
     "video_url",
     "videoUrl",
-    "fileUri",
-    "file_uri",
     "src",
   ].forEach((key) => {
     if (value[key]) {
       collectResultUrls(value[key], bucket);
     }
   });
+
+  if (typeof value.b64_json === "string" && value.b64_json.trim()) {
+    bucket.push(`data:image/png;base64,${value.b64_json.trim()}`);
+  }
 
   Object.keys(value).forEach((key) => {
     const nestedValue = value[key];
@@ -1093,64 +1004,17 @@ const extractResultStatus = (payload) =>
   )
     .trim()
     .toUpperCase();
-const toImmediateImagePayload = (payload) => {
-  const resultUrls = extractResultUrlsFromPayload(payload);
-  return {
-    ...payload,
-    url: payload?.url || payload?.image_url || resultUrls[0] || null,
-    image_url: payload?.image_url || payload?.url || resultUrls[0] || null,
-    images: Array.isArray(payload?.images) ? payload.images : resultUrls,
-    results:
-      Array.isArray(payload?.results) && payload.results.length > 0
-        ? payload.results
-        : resultUrls.map((url) => ({ url, content: "" })),
-  };
-};
-const removeEmptyValues = (source) =>
-  Object.fromEntries(
-    Object.entries(source || {}).filter(
-      ([, value]) => value !== undefined && value !== null && value !== "",
-    ),
+const hasExplicitImageTaskId = (payload) =>
+  Boolean(
+    payload?.task_id ||
+      payload?.taskId ||
+      payload?.data?.task_id ||
+      payload?.data?.taskId,
   );
-const RESULT_URL_FIELD_KEYS = new Set([
-  "url",
-  "uri",
-  "output",
-  "image_url",
-  "imageUrl",
-  "video_url",
-  "videoUrl",
-  "fileUri",
-  "file_uri",
-  "src",
-]);
-const buildProxyMediaUrlForRequest = (req, mediaType, rawUrl) => {
-  const input = String(rawUrl || "").trim();
-  if (!input) return input;
-  if (/^\/api\/proxy\//i.test(input)) return input;
-  if (/^https:\/\//i.test(input)) return input;
-  if (!/^http:\/\//i.test(input)) return input;
-  const targetMediaType = String(mediaType || "image").trim().toLowerCase();
-  return `/api/proxy/${targetMediaType}?url=${encodeURIComponent(input)}`;
-};
-const mapResultUrlsInPayload = (payload, mapper) => {
-  if (typeof payload === "string") return payload;
-  if (Array.isArray(payload)) {
-    return payload.map((item) => mapResultUrlsInPayload(item, mapper));
-  }
-  if (!payload || typeof payload !== "object") return payload;
-
-  const mapped = {};
-  Object.keys(payload).forEach((key) => {
-    const value = payload[key];
-    if (RESULT_URL_FIELD_KEYS.has(key) && typeof value === "string") {
-      mapped[key] = mapper(value);
-    } else {
-      mapped[key] = mapResultUrlsInPayload(value, mapper);
-    }
-  });
-  return mapped;
-};
+const isImmediateImageResultPayload = (payload, resultUrls = extractResultUrlsFromPayload(payload)) =>
+  resultUrls.length > 0 &&
+  (isTaskSuccessStatus(extractResultStatus(payload)) ||
+    (!extractResultStatus(payload) && !hasExplicitImageTaskId(payload)));
 const buildGenerationRecordPayload = async ({
   req,
   billingAccount = null,
@@ -1230,6 +1094,76 @@ const completeGenerationRecordSuccessSafe = async ({
     await completeGenerationRecordByTaskId(taskId, updates).catch(() => null);
   }
 };
+const buildGeneratedAssetContext = ({
+  req = null,
+  billingAccount = null,
+  generationRecord = null,
+  route = null,
+  modelId = null,
+  taskId = null,
+  requestId = null,
+} = {}) => ({
+  userId:
+    req?.authUser?.userId ||
+    generationRecord?.userId ||
+    billingAccount?.userId ||
+    billingAccount?.ownerUserId ||
+    "anonymous",
+  recordId: generationRecord?.id || null,
+  taskId: taskId || generationRecord?.taskId || null,
+  routeId: route?.id || null,
+  routeLine: route?.line || null,
+  modelId: modelId || generationRecord?.modelId || null,
+  requestId,
+});
+const mergeGeneratedAssetMeta = (meta = null, persisted = null) => {
+  if (!persisted?.enabled) return meta || null;
+  return {
+    ...(meta || {}),
+    assetPersistence: {
+      enabled: true,
+      stored: persisted.assets?.length || 0,
+      failed: persisted.errors?.length || 0,
+      assets: (persisted.assets || []).map((asset) => ({
+        objectKey: asset.objectKey || null,
+        storedUrl: asset.storedUrl || null,
+        thumbnailUrl: asset.thumbnailUrl || null,
+        mimeType: asset.mimeType || null,
+        size: asset.size || null,
+        skipped: asset.skipped === true,
+        reason: asset.reason || null,
+      })),
+      errors: (persisted.errors || []).map((item) => ({
+        error: item.error || "Generated asset persistence failed",
+      })),
+    },
+  };
+};
+const persistImageResultPayloadSafe = async ({
+  payload = null,
+  resultUrls = [],
+  req = null,
+  billingAccount = null,
+  generationRecord = null,
+  route = null,
+  modelId = null,
+  taskId = null,
+  requestId = null,
+} = {}) =>
+  persistGeneratedImageResults({
+    payload,
+    resultUrls,
+    context: buildGeneratedAssetContext({
+      req,
+      billingAccount,
+      generationRecord,
+      route,
+      modelId,
+      taskId,
+      requestId,
+    }),
+    logger,
+  });
 const completeGenerationRecordFailureSafe = async ({
   recordId = null,
   taskId = null,
@@ -1291,8 +1225,7 @@ const sendAuthError = (res, error) => {
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const USER_FACING_GENERATION_ERROR_MESSAGE =
-  "请检查提示词或参考图，可能触发了安全限制，请更换后重试";
+const DEFAULT_GENERATION_ERROR_MESSAGE = "请求失败，未返回错误详情";
 const NON_IDEMPOTENT_UPSTREAM_ERROR_MESSAGE =
   "Upstream connection closed after the generation request was sent. Automatic retry is disabled to avoid duplicate billing. Please check the upstream dashboard before retrying manually.";
 const isRetryableNetworkError = (error) => {
@@ -1334,37 +1267,191 @@ const toSafeHttpStatus = (status, fallbackStatus = 500) => {
   if (numeric < 400 || numeric > 599) return fallbackStatus;
   return numeric;
 };
-const sendUserFacingGenerationError = (res, status = 500) =>
-  res.status(toSafeHttpStatus(status, 500)).json({
-    error: USER_FACING_GENERATION_ERROR_MESSAGE,
-  });
-const respondWithUserFacingGenerationError = (res, error, fallbackStatus = 500) => {
+const formatErrorValue = (value) => {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch (_error) {
+    return String(value);
+  }
+};
+
+const sanitizeErrorText = (value = "", { maxLength = 1000 } = {}) => {
+  const cleaned = String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\bsk[_-][A-Za-z0-9._-]{8,}\b/g, "sk_[redacted]")
+    .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, "AIza[redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!maxLength || cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, maxLength)}...`;
+};
+
+const extractTraceId = (value = "") => {
+  const text = String(value || "");
+  const match = text.match(/(?:trace\s*id|traceid|trace_id|request[_\s-]*id)\s*[:：]?\s*([A-Za-z0-9._-]{6,})/i);
+  return match?.[1] || "";
+};
+
+const stripTraceId = (value = "") =>
+  String(value || "")
+    .replace(/[（(]\s*(?:trace\s*id|traceid|trace_id|request[_\s-]*id)\s*[:：]?\s*[A-Za-z0-9._-]{6,}\s*[）)]/gi, "")
+    .replace(/\s*(?:trace\s*id|traceid|trace_id|request[_\s-]*id)\s*[:：]\s*[A-Za-z0-9._-]{6,}\s*/gi, " ")
+    .trim();
+
+const parseJsonLikeErrorString = (value = "") => {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (_innerError) {
+      return null;
+    }
+  }
+};
+
+const getErrorData = (error) => {
+  const data = error?.response?.data;
+  if (typeof data === "string") {
+    return parseJsonLikeErrorString(data) || data;
+  }
+  return data;
+};
+
+const getNestedErrorValue = (data, key) => {
+  if (!data || typeof data !== "object") return "";
+  const nested = data.error && typeof data.error === "object" ? data.error : null;
+  return data[key] || nested?.[key] || "";
+};
+
+const buildGenerationErrorMeta = (error, data) => {
+  const parts = [];
+  const status = error?.response?.status;
+  const geminiNative = error?.geminiNative || null;
+  const upstreamType = getNestedErrorValue(data, "type");
+  const upstreamParam = getNestedErrorValue(data, "param");
+
+  if (status) parts.push(`upstream_status=${status}`);
+  if (geminiNative?.routeId) parts.push(`route=${geminiNative.routeId}`);
+  if (geminiNative?.model) parts.push(`model=${geminiNative.model}`);
+  if (geminiNative?.imageSize) parts.push(`imageSize=${geminiNative.imageSize}`);
+  if (geminiNative?.aspectRatio) parts.push(`aspectRatio=${geminiNative.aspectRatio}`);
+  if (upstreamType) parts.push(`type=${upstreamType}`);
+  if (upstreamParam) parts.push(`param=${upstreamParam}`);
+
+  return sanitizeErrorText(parts.join("; "), { maxLength: 200 });
+};
+
+const getGenerationErrorMessage = (error, data) => {
+  if (data && typeof data === "object") {
+    const nested = data.error;
+    if (nested && typeof nested === "object" && nested.message) {
+      return nested.message;
+    }
+    if (typeof nested === "string") return nested;
+    if (data.message) return data.message;
+    if (data.details) return data.details;
+  }
+  if (typeof data === "string" && data.trim()) return data;
+  if (error?.message) return error.message;
+  return DEFAULT_GENERATION_ERROR_MESSAGE;
+};
+
+const normalizeGenerationError = (error, fallbackStatus = 500) => {
+  const data = getErrorData(error);
+  const status = toSafeHttpStatus(error?.response?.status, fallbackStatus);
+
   if (error instanceof BillingError) {
-    const isAuthError =
-      error.code === "ACCOUNT_AUTH_REQUIRED" || error.code === "AUTH_LOGIN_REQUIRED";
-    return sendUserFacingGenerationError(res, isAuthError ? 401 : 400);
+    const billingStatus =
+      error.code === "ACCOUNT_AUTH_REQUIRED" || error.code === "AUTH_LOGIN_REQUIRED" ? 401 : 400;
+    const message =
+      error.code === "INSUFFICIENT_POINTS" &&
+      Number.isFinite(Number(error.currentPoints)) &&
+      Number.isFinite(Number(error.requiredPoints))
+        ? `金币不足，当前 ${toPointNumber(error.currentPoints, 0)}，需 ${toPointNumber(error.requiredPoints, 0)}`
+        : error.message || DEFAULT_GENERATION_ERROR_MESSAGE;
+    return {
+      error: sanitizeErrorText(message),
+      code: error.code || "",
+      status: billingStatus,
+      details: "",
+      traceId: "",
+    };
   }
 
   if (error instanceof AuthError) {
-    return sendUserFacingGenerationError(
-      res,
-      error.code === "AUTH_LOGIN_REQUIRED" ? 401 : 400,
-    );
+    return {
+      error: sanitizeErrorText(error.message || DEFAULT_GENERATION_ERROR_MESSAGE),
+      code: error.code || "",
+      status: error.code === "AUTH_LOGIN_REQUIRED" ? 401 : 400,
+      details: "",
+      traceId: "",
+    };
+  }
+
+  let message = getGenerationErrorMessage(error, data);
+  const traceId =
+    extractTraceId(message) ||
+    extractTraceId(formatErrorValue(data)) ||
+    String(error?.response?.headers?.["x-request-id"] || error?.response?.headers?.["x-trace-id"] || "").trim();
+  message = stripTraceId(message);
+
+  return {
+    error: sanitizeErrorText(message || DEFAULT_GENERATION_ERROR_MESSAGE),
+    code: sanitizeErrorText(String(error?.code || getNestedErrorValue(data, "code") || ""), { maxLength: 80 }),
+    status,
+    details: buildGenerationErrorMeta(error, data),
+    traceId: sanitizeErrorText(traceId, { maxLength: 120 }),
+  };
+};
+
+const buildErrorDetails = (error) => {
+  const normalized = normalizeGenerationError(error);
+  return [normalized.details, normalized.traceId ? `traceId=${normalized.traceId}` : ""]
+    .filter(Boolean)
+    .join("; ");
+};
+
+const sendUserFacingGenerationError = (res, status = 500, error = null) => {
+  const normalized = normalizeGenerationError(error, status);
+  const responseStatus = toSafeHttpStatus(normalized.status || status, 500);
+  const payload = {
+    error: normalized.error,
+    status: responseStatus,
+  };
+  if (normalized.code) payload.code = normalized.code;
+  if (normalized.traceId) payload.traceId = normalized.traceId;
+  if (normalized.details) payload.details = normalized.details;
+  return res.status(responseStatus).json(payload);
+};
+const respondWithUserFacingGenerationError = (res, error, fallbackStatus = 500) => {
+  if (error instanceof BillingError) {
+    return sendUserFacingGenerationError(res, fallbackStatus, error);
+  }
+
+  if (error instanceof AuthError) {
+    return sendUserFacingGenerationError(res, fallbackStatus, error);
   }
 
   if (error?.response?.status) {
-    return sendUserFacingGenerationError(res, error.response.status);
+    return sendUserFacingGenerationError(res, error.response.status, error);
   }
 
   if (error?.code === "ECONNABORTED") {
-    return sendUserFacingGenerationError(res, 504);
+    return sendUserFacingGenerationError(res, 504, error);
   }
 
   if (isRetryableNetworkError(error)) {
-    return sendUserFacingGenerationError(res, 502);
+    return sendUserFacingGenerationError(res, 502, error);
   }
 
-  return sendUserFacingGenerationError(res, fallbackStatus);
+  return sendUserFacingGenerationError(res, fallbackStatus, error);
 };
 const requestWithRetry = async (
   fn,
@@ -1396,12 +1483,24 @@ const createTransientHttpsAgent = () =>
     maxCachedSessions: 0,
   });
 
+const extractAuthorizationToken = (authorization = "") =>
+  String(authorization || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+
 const buildUpstreamJsonRequestConfig = (
   authorization,
-  { httpsAgent = SHARED_HTTPS_AGENT, closeConnection = false } = {},
+  {
+    httpsAgent = SHARED_HTTPS_AGENT,
+    closeConnection = false,
+    includeGoogleApiKey = false,
+  } = {},
 ) => ({
   headers: {
     Authorization: authorization,
+    ...(includeGoogleApiKey
+      ? { "x-goog-api-key": extractAuthorizationToken(authorization) }
+      : {}),
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
     ...(closeConnection ? { Connection: "close" } : {}),
@@ -1428,6 +1527,7 @@ const postJsonWithFetch = async ({
   authorization,
   label,
   closeConnection = false,
+  includeGoogleApiKey = false,
 }) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 600000);
@@ -1436,6 +1536,9 @@ const postJsonWithFetch = async ({
       method: "POST",
       headers: {
         Authorization: authorization,
+        ...(includeGoogleApiKey
+          ? { "x-goog-api-key": extractAuthorizationToken(authorization) }
+          : {}),
         "Content-Type": "application/json",
         ...(closeConnection ? { Connection: "close" } : {}),
       },
@@ -1491,6 +1594,7 @@ const postJsonWithTlsFallback = async ({
   body,
   authorization,
   label,
+  includeGoogleApiKey = false,
 }) => {
   return axios.post(
     endpoint,
@@ -1498,6 +1602,7 @@ const postJsonWithTlsFallback = async ({
     buildUpstreamJsonRequestConfig(authorization, {
       httpsAgent: createTransientHttpsAgent(),
       closeConnection: true,
+      includeGoogleApiKey,
     }),
   );
 };
@@ -1523,22 +1628,50 @@ const executeGeminiNativeGenerate = async ({
   }
 
   const processImagePart = (img, { camelCase = false } = {}) => {
-    let base64Data = img;
-    let mimeType = "image/jpeg";
+    const rawValue =
+      typeof img === "string"
+        ? img
+        : img && typeof img === "object"
+          ? String(img.fileUri || img.file_uri || "").trim()
+          : "";
+    const explicitMimeType =
+      typeof img === "object" && img
+        ? String(img.mimeType || img.mime_type || "").trim().toLowerCase()
+        : "";
+    let normalizedValue = String(rawValue || "").trim();
+    let mimeType = explicitMimeType || "image/jpeg";
 
-    if (typeof img === "string" && img.startsWith("data:")) {
-      const match = img.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (normalizedValue.startsWith("data:")) {
+      const match = normalizedValue.match(/^data:(image\/\w+);base64,(.+)$/);
       if (match) {
         mimeType = match[1];
-        base64Data = match[2];
+        normalizedValue = match[2];
       }
+    }
+
+    if (/^https?:\/\//i.test(normalizedValue)) {
+      if (camelCase) {
+        return {
+          fileData: {
+            mimeType,
+            fileUri: normalizedValue,
+          },
+        };
+      }
+
+      return {
+        file_data: {
+          mime_type: mimeType,
+          file_uri: normalizedValue,
+        },
+      };
     }
 
     if (camelCase) {
       return {
         inlineData: {
           mimeType,
-          data: base64Data,
+          data: normalizedValue,
         },
       };
     }
@@ -1546,7 +1679,7 @@ const executeGeminiNativeGenerate = async ({
     return {
       inline_data: {
         mime_type: mimeType,
-        data: base64Data,
+        data: normalizedValue,
       },
     };
   };
@@ -1559,13 +1692,23 @@ const executeGeminiNativeGenerate = async ({
       img.forEach((item) => appendImagePart(item));
       return;
     }
-    if (typeof img !== "string") return;
-    const normalized = String(img || "").trim();
+    const normalized =
+      typeof img === "string"
+        ? String(img || "").trim()
+        : img && typeof img === "object"
+          ? String(img.fileUri || img.file_uri || "").trim()
+          : "";
     if (!normalized) return;
-    if (seenImageParts.has(normalized)) return;
-    seenImageParts.add(normalized);
-    camelParts.push(processImagePart(normalized, { camelCase: true }));
-    snakeParts.push(processImagePart(normalized));
+    const mimeType =
+      img && typeof img === "object"
+        ? String(img.mimeType || img.mime_type || "").trim().toLowerCase()
+        : "";
+    const dedupeKey = `${mimeType}|${normalized}`;
+    if (seenImageParts.has(dedupeKey)) return;
+    seenImageParts.add(dedupeKey);
+    const payload = mimeType ? { fileUri: normalized, mimeType } : normalized;
+    camelParts.push(processImagePart(payload, { camelCase: true }));
+    snakeParts.push(processImagePart(payload));
   };
 
   if (Array.isArray(requestBody.images)) {
@@ -1585,6 +1728,14 @@ const executeGeminiNativeGenerate = async ({
         appendImagePart(
           `data:${inlineData.mimeType || inlineData.mime_type || "image/jpeg"};base64,${inlineData.data}`,
         );
+        return;
+      }
+      const fileData = part.fileData || part.file_data;
+      if (fileData?.fileUri || fileData?.file_uri) {
+        appendImagePart({
+          fileUri: fileData.fileUri || fileData.file_uri,
+          mimeType: fileData.mimeType || fileData.mime_type || "image/jpeg",
+        });
       }
     });
   }
@@ -1592,6 +1743,7 @@ const executeGeminiNativeGenerate = async ({
   const finalImageSize = (
     requestBody.image_size ||
     requestBody.imageSize ||
+    requestBody.size ||
     requestBody.generationConfig?.imageConfig?.imageSize ||
     requestBody.generationConfig?.image_config?.image_size ||
     "1K"
@@ -1613,7 +1765,7 @@ const executeGeminiNativeGenerate = async ({
   const authorization = getRouteAuthorization(route, fallbackAuthorization);
   const buildGeminiBodies = (resolvedImageSize) => {
     const camelBody = {
-      contents: [{ parts: camelParts }],
+      contents: [{ role: "user", parts: camelParts }],
       generationConfig: {
         responseModalities:
           output_format === "IMAGE_ONLY" ? ["IMAGE"] : ["IMAGE", "TEXT"],
@@ -1632,7 +1784,7 @@ const executeGeminiNativeGenerate = async ({
     }
 
     const snakeBody = {
-      contents: [{ parts: snakeParts }],
+      contents: [{ role: "user", parts: snakeParts }],
       generationConfig: {
         response_modalities:
           output_format === "IMAGE_ONLY" ? ["IMAGE"] : ["IMAGE", "TEXT"],
@@ -1682,6 +1834,7 @@ const executeGeminiNativeGenerate = async ({
         body: camelBody,
         authorization,
         label: `${logTag}-${route.id}-camel-${resolvedImageSize}`,
+        includeGoogleApiKey: true,
       });
     } catch (firstErr) {
       if (firstErr.response?.status === 400) {
@@ -1695,6 +1848,7 @@ const executeGeminiNativeGenerate = async ({
             body: snakeBody,
             authorization,
             label: `${logTag}-${route.id}-snake-${resolvedImageSize}`,
+            includeGoogleApiKey: true,
           });
         } catch (secondErr) {
           if (secondErr.response?.status === 400) {
@@ -1710,6 +1864,7 @@ const executeGeminiNativeGenerate = async ({
               body: noConfigBody,
               authorization,
               label: `${logTag}-${route.id}-no-config-${resolvedImageSize}`,
+              includeGoogleApiKey: true,
             });
           }
           throw secondErr;
@@ -1719,7 +1874,19 @@ const executeGeminiNativeGenerate = async ({
     }
   };
 
-  const response = await executeGeminiPayloadSequence(finalImageSize);
+  let response;
+  try {
+    response = await executeGeminiPayloadSequence(finalImageSize);
+  } catch (error) {
+    error.geminiNative = {
+      routeId: route?.id || null,
+      model,
+      endpoint,
+      imageSize: finalImageSize,
+      aspectRatio: normalizedAspectRatio,
+    };
+    throw error;
+  }
 
   const candidates = response.data?.candidates;
   if (!candidates || candidates.length === 0) {
@@ -1764,6 +1931,9 @@ app.use(
   helmet({
     contentSecurityPolicy: false, // Totally disable CSP to allow blob: and data: images
     crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
+    crossOriginResourcePolicy: false,
+    originAgentCluster: false,
   })
 );
 
@@ -1781,35 +1951,58 @@ const getUserKey = (req) => {
   // Use API key if available, otherwise fall back to IP (with IPv6 support)
   return apiKey && apiKey.length > 10 ? apiKey : ipKeyGenerator(req);
 };
+const readPositiveIntEnv = (name, fallback) => {
+  const value = Number.parseInt(String(process.env[name] || ""), 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+const buildRateLimitHandler = (code, message) => (req, res) => {
+  logger.warn({
+    timestamp: new Date().toISOString(),
+    type: "Rate Limit",
+    code,
+    path: req.originalUrl,
+    key: getUserKey(req),
+    retryAfter: res.getHeader("Retry-After") || null,
+  });
+  res.status(429).json({
+    error: message,
+    code,
+    retryAfter: res.getHeader("Retry-After") || null,
+  });
+};
+
+const GLOBAL_RATE_LIMIT_MAX = readPositiveIntEnv("GLOBAL_RATE_LIMIT_MAX", 5000);
+const POLLING_RATE_LIMIT_MAX = readPositiveIntEnv("POLLING_RATE_LIMIT_MAX", 300);
+const GENERATE_RATE_LIMIT_MAX = readPositiveIntEnv("GENERATE_RATE_LIMIT_MAX", 80);
 
 // Global fallback limiter (per user)
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,  // 15 minutes
-  max: 1500,                  // 1500 requests per user per 15 minutes (increased for public service)
+  max: GLOBAL_RATE_LIMIT_MAX,
   keyGenerator: getUserKey,
   standardHeaders: true,
   legacyHeaders: false,
-  message: "Too many requests. Please try again later.",
+  handler: buildRateLimitHandler("GLOBAL_RATE_LIMITED", "请求过于频繁，请稍后再试。"),
 });
 
-// Polling endpoints - per user, high frequency
+// Polling endpoints - per user. Supports multi-image batches and restored pending tasks.
 const pollingLimiter = rateLimit({
   windowMs: 60 * 1000,       // 1 minute
-  max: 50,                    // 50 requests per user per minute (allows ~2-3 concurrent tasks per user)
+  max: POLLING_RATE_LIMIT_MAX,
   keyGenerator: getUserKey,
   standardHeaders: true,
   legacyHeaders: false,
-  message: "Polling requests are too frequent. Please try again later.",
+  handler: buildRateLimitHandler("POLLING_RATE_LIMITED", "任务查询过于频繁，请稍后再试。"),
 });
 
-// Generation endpoints - per user, moderate limits
+// Generation endpoints - per user. A single 16-image batch can submit 16 requests.
 const generateLimiter = rateLimit({
   windowMs: 60 * 1000,       // 1 minute
-  max: 10,                    // 10 generation requests per user per minute
+  max: GENERATE_RATE_LIMIT_MAX,
   keyGenerator: getUserKey,
   standardHeaders: true,
   legacyHeaders: false,
-  message: "Generation requests are too frequent. Please try again later.",
+  handler: buildRateLimitHandler("GENERATE_RATE_LIMITED", "提交过于频繁，请稍后再试。"),
 });
 
 // Announcement endpoint - per IP, very lenient (read-only)
@@ -1827,23 +2020,9 @@ const announcementLimiter = rateLimit({
 app.use("/api", globalLimiter);
 
 app.use(cors());
-app.use(express.json({ limit: "20mb" })); // Guard against oversized Base64 payloads causing OOM.
+app.use(express.json({ limit: "50mb" })); // Support large Base64 request payloads.
 app.use(async (req, _res, next) => {
   try {
-    const bodySessionToken = String(
-      req.body?.authSessionToken || req.body?.auth_session_token || "",
-    ).trim();
-    if (!req.headers["x-auth-session"] && bodySessionToken) {
-      req.headers["x-auth-session"] = bodySessionToken;
-    }
-    if (!req.headers["x-auth-session"]) {
-      const cookieSessionToken = decodeURIComponent(
-        getCookieValue(req.headers.cookie, "auth-session-v1"),
-      ).trim();
-      if (cookieSessionToken) {
-        req.headers["x-auth-session"] = cookieSessionToken;
-      }
-    }
     req.authUser = await getSessionUserFromRequest(req);
   } catch (error) {
     console.error("[Auth] Session middleware error:", error.message);
@@ -2103,14 +2282,22 @@ app.get("/api/generation-records", async (req, res) => {
     const user = await requireAuthUser(req);
     const mediaType = String(req.query?.mediaType || "all").trim().toUpperCase();
     const status = String(req.query?.status || "all").trim().toUpperCase();
+    const uiMode = String(req.query?.uiMode || "all").trim().toLowerCase();
+    const recentDays = parsePositivePage(req.query?.days, 5);
     const page = parsePositivePage(req.query?.page, 1);
     const pageSize = Math.min(100, parsePositivePage(req.query?.pageSize, 50));
+    const sinceCreatedAt = String(req.query?.sinceCreatedAt || "").trim() || null;
+    const sinceId = String(req.query?.sinceId || "").trim() || null;
 
     const result = await listGenerationRecordsForUser(user.userId, {
       mediaType,
       status,
+      uiMode,
+      recentDays,
       page,
       pageSize,
+      sinceCreatedAt,
+      sinceId,
     });
 
     res.json({
@@ -2127,8 +2314,10 @@ app.delete("/api/generation-records", async (req, res) => {
   try {
     const user = await requireAuthUser(req);
     const mediaType = String(req.query?.mediaType || "all").trim().toUpperCase();
+    const uiMode = String(req.query?.uiMode || "all").trim().toLowerCase();
     const result = await clearGenerationRecordsForUser(user.userId, {
       mediaType,
+      uiMode,
     });
     res.json({
       success: true,
@@ -2310,46 +2499,14 @@ app.post("/api/admin/redeem-codes", async (req, res) => {
   }
 });
 
-app.post("/api/admin/billing/compensation-scan", async (req, res) => {
-  try {
-    await requireSuperAdminAccess(req);
-    const pendingTimeoutMinutes = Number.parseInt(
-      String(req.body?.pendingTimeoutMinutes || process.env.PENDING_TASK_TIMEOUT_MINUTES || "30"),
-      10,
-    );
-    const limit = Number.parseInt(String(req.body?.limit || 500), 10);
-
-    const result = await scanAndCompensateAbnormalOrders({
-      pendingTimeoutMinutes,
-      limit,
-    });
-
-    await logAdminCatalogChange(req, {
-      action: "billing.compensation_scan",
-      entityType: "billing_pending_tasks",
-      entityId: "manual_scan",
-      summary: `Compensation scan: refunded ${result.compensated} / scanned ${result.scanned}`,
-      detail: result,
-    });
-
-    res.json({
-      success: true,
-      ...result,
-    });
-  } catch (error) {
-    if (sendAuthError(res, error)) return;
-    if (sendBillingError(res, error)) return;
-    res.status(500).json({ error: error.message || "Failed to run compensation scan" });
-  }
-});
-
 app.get("/api/admin/users", async (req, res) => {
   try {
-    await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
+    const actor = await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
     const result = await listAdminUsers({
       search: String(req.query?.search || "").trim(),
       page: parsePositivePage(req.query?.page, 1),
       pageSize: parsePositivePage(req.query?.pageSize, 20),
+      includeAdminNote: actor?.isSuperAdmin === true,
     });
     res.json(await buildAdminUserListPayload(result));
   } catch (error) {
@@ -2361,9 +2518,9 @@ app.get("/api/admin/users", async (req, res) => {
 
 app.get("/api/admin/users/:userId", async (req, res) => {
   try {
-    await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
+    const actor = await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
     const userId = String(req.params.userId || "").trim();
-    const user = await getAdminUserById(userId);
+    const user = await getAdminUserById(userId, { includeAdminNote: actor?.isSuperAdmin === true });
     if (!user) {
       return res.status(404).json({ error: "User does not exist" });
     }
@@ -2388,6 +2545,7 @@ app.patch("/api/admin/users/:userId", async (req, res) => {
       displayName: req.body?.displayName,
       role: req.body?.role,
       status: req.body?.status,
+      adminNote: req.body?.adminNote,
     });
     res.json(
       await buildAdminUserDetailPayload(user, {
@@ -2399,69 +2557,6 @@ app.patch("/api/admin/users/:userId", async (req, res) => {
     if (sendAuthError(res, error)) return;
     if (sendBillingError(res, error)) return;
     res.status(500).json({ error: error.message || "Failed to update user" });
-  }
-});
-
-app.post("/api/admin/users/:userId/reset-password", async (req, res) => {
-  try {
-    const actor = await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
-    const userId = String(req.params.userId || "").trim();
-    const user = await resetAdminManagedUserPassword(actor, userId, "1234567890");
-
-    await logAdminCatalogChange(req, {
-      action: "admin.reset_user_password",
-      entityType: "user",
-      entityId: user.userId,
-      summary: `Reset password for ${user.email}`,
-      detail: {
-        targetUserId: user.userId,
-        targetEmail: user.email,
-        resetTo: "1234567890",
-      },
-    });
-
-    res.json(
-      await buildAdminUserDetailPayload(user, {
-        ledgerPage: parsePositivePage(req.query?.ledgerPage, 1),
-        ledgerPageSize: parsePositivePage(req.query?.ledgerPageSize, 20),
-      }),
-    );
-  } catch (error) {
-    if (sendAuthError(res, error)) return;
-    if (sendBillingError(res, error)) return;
-    res.status(500).json({ error: error.message || "Failed to reset password" });
-  }
-});
-
-app.post("/api/admin/users/:userId/status", async (req, res) => {
-  try {
-    const actor = await requireAdminAccess(req, EMERGENCY_ADMIN_API_KEYS);
-    const userId = String(req.params.userId || "").trim();
-    const nextStatus = String(req.body?.status || "").trim();
-    const user = await setAdminManagedUserStatus(actor, userId, nextStatus);
-
-    await logAdminCatalogChange(req, {
-      action: "admin.update_user_status",
-      entityType: "user",
-      entityId: user.userId,
-      summary: `${user.email} status changed to ${user.status}`,
-      detail: {
-        targetUserId: user.userId,
-        targetEmail: user.email,
-        status: user.status,
-      },
-    });
-
-    res.json(
-      await buildAdminUserDetailPayload(user, {
-        ledgerPage: parsePositivePage(req.query?.ledgerPage, 1),
-        ledgerPageSize: parsePositivePage(req.query?.ledgerPageSize, 20),
-      }),
-    );
-  } catch (error) {
-    if (sendAuthError(res, error)) return;
-    if (sendBillingError(res, error)) return;
-    res.status(500).json({ error: error.message || "Failed to update user status" });
   }
 });
 
@@ -2996,6 +3091,116 @@ app.get("/api/balance/info", async (req, res) => {
   }
 });
 
+const GPT_IMAGE2_SIZE_PATTERN = /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/;
+const GPT_IMAGE2_RATIO_PATTERN = /^\s*(\d+(?:\.\d+)?)\s*[:xX×]\s*(\d+(?:\.\d+)?)\s*$/;
+const GPT_IMAGE2_SIZE_MULTIPLE = 16;
+const GPT_IMAGE2_MAX_EDGE = 3840;
+const GPT_IMAGE2_MAX_ASPECT_RATIO = 3;
+const GPT_IMAGE2_MIN_PIXELS = 655360;
+const GPT_IMAGE2_MAX_PIXELS = 8294400;
+const GPT_IMAGE2_REQUEST_MODELS = new Set(["gpt-image-2", "gpt-image-2-all"]);
+
+const isGptImage2RequestModel = (model = "") =>
+  GPT_IMAGE2_REQUEST_MODELS.has(String(model || "").trim());
+
+const roundGptImage2ToMultiple = (value, multiple = GPT_IMAGE2_SIZE_MULTIPLE) =>
+  Math.max(multiple, Math.round(Number(value || 0) / multiple) * multiple);
+
+const floorGptImage2ToMultiple = (value, multiple = GPT_IMAGE2_SIZE_MULTIPLE) =>
+  Math.max(multiple, Math.floor(Number(value || 0) / multiple) * multiple);
+
+const ceilGptImage2ToMultiple = (value, multiple = GPT_IMAGE2_SIZE_MULTIPLE) =>
+  Math.max(multiple, Math.ceil(Number(value || 0) / multiple) * multiple);
+
+const parseGptImage2Ratio = (ratio) => {
+  const match = String(ratio || "").trim().match(GPT_IMAGE2_RATIO_PATTERN);
+  if (!match) return { width: 1, height: 1 };
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return { width: 1, height: 1 };
+  }
+  return { width, height };
+};
+
+const normalizeGptImage2Dimensions = (width, height) => {
+  let normalizedWidth = roundGptImage2ToMultiple(width);
+  let normalizedHeight = roundGptImage2ToMultiple(height);
+  const scaleToFit = (scale) => {
+    normalizedWidth = floorGptImage2ToMultiple(normalizedWidth * scale);
+    normalizedHeight = floorGptImage2ToMultiple(normalizedHeight * scale);
+  };
+  const scaleToFill = (scale) => {
+    normalizedWidth = ceilGptImage2ToMultiple(normalizedWidth * scale);
+    normalizedHeight = ceilGptImage2ToMultiple(normalizedHeight * scale);
+  };
+
+  for (let i = 0; i < 4; i += 1) {
+    const maxEdge = Math.max(normalizedWidth, normalizedHeight);
+    if (maxEdge > GPT_IMAGE2_MAX_EDGE) {
+      scaleToFit(GPT_IMAGE2_MAX_EDGE / maxEdge);
+    }
+
+    if (normalizedWidth / normalizedHeight > GPT_IMAGE2_MAX_ASPECT_RATIO) {
+      normalizedWidth = floorGptImage2ToMultiple(normalizedHeight * GPT_IMAGE2_MAX_ASPECT_RATIO);
+    } else if (normalizedHeight / normalizedWidth > GPT_IMAGE2_MAX_ASPECT_RATIO) {
+      normalizedHeight = floorGptImage2ToMultiple(normalizedWidth * GPT_IMAGE2_MAX_ASPECT_RATIO);
+    }
+
+    const pixels = normalizedWidth * normalizedHeight;
+    if (pixels > GPT_IMAGE2_MAX_PIXELS) {
+      scaleToFit(Math.sqrt(GPT_IMAGE2_MAX_PIXELS / pixels));
+    } else if (pixels < GPT_IMAGE2_MIN_PIXELS) {
+      scaleToFill(Math.sqrt(GPT_IMAGE2_MIN_PIXELS / pixels));
+    }
+  }
+
+  return { width: normalizedWidth, height: normalizedHeight };
+};
+
+const normalizeGptImage2RequestSize = (size, ratio = "1:1") => {
+  const normalizedSize = String(size || "auto").trim().toLowerCase();
+  if (!normalizedSize || normalizedSize === "auto") return "auto";
+
+  const explicitMatch = normalizedSize.match(GPT_IMAGE2_SIZE_PATTERN);
+  if (explicitMatch) {
+    const normalized = normalizeGptImage2Dimensions(Number(explicitMatch[1]), Number(explicitMatch[2]));
+    return `${normalized.width}x${normalized.height}`;
+  }
+
+  const tier = normalizedSize === "4k" ? "4k" : normalizedSize === "2k" ? "2k" : "1k";
+  const parsedRatio = parseGptImage2Ratio(ratio);
+  const ratioWidth = parsedRatio.width;
+  const ratioHeight = parsedRatio.height;
+  let width;
+  let height;
+
+  if (ratioWidth === ratioHeight) {
+    const side = tier === "1k" ? 1024 : tier === "2k" ? 2048 : 3840;
+    width = side;
+    height = side;
+  } else if (tier === "1k") {
+    const shortSide = 1024;
+    width = ratioWidth > ratioHeight
+      ? roundGptImage2ToMultiple((shortSide * ratioWidth) / ratioHeight)
+      : shortSide;
+    height = ratioWidth > ratioHeight
+      ? shortSide
+      : roundGptImage2ToMultiple((shortSide * ratioHeight) / ratioWidth);
+  } else {
+    const longSide = tier === "2k" ? 2048 : 3840;
+    width = ratioWidth > ratioHeight
+      ? longSide
+      : roundGptImage2ToMultiple((longSide * ratioWidth) / ratioHeight);
+    height = ratioWidth > ratioHeight
+      ? roundGptImage2ToMultiple((longSide * ratioHeight) / ratioWidth)
+      : longSide;
+  }
+
+  const normalized = normalizeGptImage2Dimensions(width, height);
+  return `${normalized.width}x${normalized.height}`;
+};
+
 // ==================== Image Generation ====================
 app.post("/api/generate", generateLimiter, async (req, res) => {
   let billingAccount = null;
@@ -3003,50 +3208,6 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
   let localTaskId = null;
   let chargeRouteId = null;
   let generationRecord = null;
-  let clientConnectionClosed = false;
-  let refundedForDisconnectedClient = false;
-  const markClientDisconnected = () => {
-    if (!res.writableEnded) {
-      clientConnectionClosed = true;
-    }
-  };
-  req.on("aborted", markClientDisconnected);
-  res.on("close", markClientDisconnected);
-
-  const maybeRefundForDisconnectedClient = async () => {
-    if (refundedForDisconnectedClient) return;
-    if (!billingAccount?.accountId || !billingCharge?.chargeId) return;
-    refundedForDisconnectedClient = true;
-    try {
-      if (localTaskId) {
-        await settlePendingTask(localTaskId, "FAILED");
-      } else {
-        await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
-          reason: "client_disconnected",
-          routeId: chargeRouteId,
-        });
-      }
-    } catch (refundError) {
-      console.warn(
-        "[Generate] Failed to rollback billing after client disconnect:",
-        refundError?.message || refundError,
-      );
-    }
-  };
-
-  const sendSuccessResponse = async (payload) => {
-    if (
-      clientConnectionClosed ||
-      req.aborted ||
-      res.writableEnded ||
-      res.destroyed
-    ) {
-      await maybeRefundForDisconnectedClient();
-      return false;
-    }
-    res.json(payload);
-    return true;
-  };
   try {
     const fallbackAuthorization = req.headers["authorization"];
     const requestBody = { ...(req.body || {}) };
@@ -3059,10 +3220,29 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
     );
     const shouldUseBilling = !useUserProvidedApiKey;
     if (!route) {
-      return sendUserFacingGenerationError(res, 400);
+      return sendUserFacingGenerationError(res, 400, new Error("图片线路不存在或已停用，请联系管理员"));
     }
 
     delete requestBody.uiMode;
+    const routeMode = String(route?.mode || "").trim().toLowerCase();
+    const geminiRequestedCount = Math.max(
+      1,
+      Number.parseInt(
+        String(
+          requestBody.n ||
+            requestBody.candidateCount ||
+            requestBody.generationConfig?.candidateCount ||
+            requestBody.generationConfig?.candidate_count ||
+            1,
+        ),
+        10,
+      ) || 1,
+    );
+    if (isGeminiNativeRoute(route) && geminiRequestedCount > 1) {
+      return res.status(400).json({
+        error: "当前 Gemini 原生线路暂仅支持 1 张图片，请先选择 1 张生成。",
+      });
+    }
     const pointCost = shouldUseBilling ? getRoutePointCost(route, requestBody.n, requestBody) : 0;
     if (shouldUseBilling) {
       billingAccount = await requireBillingAccount(req);
@@ -3078,11 +3258,12 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
     );
 
     if (isGeminiNativeRoute(route)) {
+      const isAsyncGeminiRoute = routeMode === "async";
       if (shouldUseBilling) {
         billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
           action: "generate",
           routeId: route.id,
-          mode: route.mode,
+          mode: isAsyncGeminiRoute ? "async" : route.mode,
           model: requestBody.model,
           modelId: requestedImageModel?.id || null,
         });
@@ -3104,9 +3285,162 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
         status: "PENDING",
         meta: {
           transport: route.transport,
-          routeMode: route.mode,
+          routeMode: isAsyncGeminiRoute ? "async" : route.mode,
         },
       });
+
+      if (isAsyncGeminiRoute) {
+        const localJobId = createLocalImageJobId();
+        localTaskId = buildImageTaskToken(route.id, localJobId);
+        setLocalImageJob(localJobId, {
+          localTaskId,
+          routeId: route.id,
+          status: "processing",
+          progress: 0,
+          results: [],
+        });
+        scheduleLocalImageJobCleanup(localJobId);
+
+        if (shouldUseBilling) {
+          await registerPendingTask(localTaskId, {
+            accountId: billingAccount.accountId,
+            chargeId: billingCharge?.chargeId || null,
+            points: pointCost,
+            routeId: route.id,
+            action: "generate",
+          });
+        }
+        if (generationRecord?.id) {
+          await attachTaskToGenerationRecord(generationRecord.id, localTaskId);
+        }
+
+        (async () => {
+          try {
+            const result = await executeGeminiNativeGenerate({
+              route,
+              requestBody,
+              fallbackAuthorization,
+              logTag: "Generate",
+            });
+            const resultUrls = extractResultUrlsFromPayload(result);
+            let successPayload = {
+              ...toImmediateImagePayload(result),
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "succeeded",
+            };
+            const persistedResult = await persistImageResultPayloadSafe({
+              payload: successPayload,
+              resultUrls,
+              req,
+              billingAccount,
+              generationRecord,
+              route,
+              modelId: requestedImageModel?.id || null,
+              taskId: localTaskId,
+            });
+            successPayload = {
+              ...persistedResult.payload,
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "succeeded",
+            };
+            setLocalImageJob(localJobId, {
+              status: "succeeded",
+              progress: 100,
+              responseData: successPayload,
+            });
+            await settlePendingTask(localTaskId, "SUCCESS");
+            await completeGenerationRecordSuccessSafe({
+              recordId: generationRecord?.id,
+              taskId: localTaskId,
+              resultUrls: persistedResult.resultUrls,
+              previewUrl: persistedResult.previewUrl,
+              outputSize: requestBody.image_size || requestBody.size || null,
+              aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
+              meta: mergeGeneratedAssetMeta({
+                transport: route.transport,
+                routeMode: "async",
+                settled: "gemini_native_background_job",
+              }, persistedResult),
+            });
+          } catch (error) {
+            const normalizedError = normalizeGenerationError(error);
+            const failureDetails = normalizedError.error;
+            setLocalImageJob(localJobId, {
+              status: "failed",
+              progress: 100,
+              responseData: {
+                id: localTaskId,
+                task_id: localTaskId,
+                status: "failed",
+                error: failureDetails,
+                code: normalizedError.code || undefined,
+                statusCode: normalizedError.status,
+                traceId: normalizedError.traceId || undefined,
+                details: normalizedError.details || undefined,
+                failure_reason: failureDetails,
+                upstream_status: error.response?.status || null,
+                upstream_error: error.response?.data || null,
+                upstream_context: error.geminiNative || null,
+                results: [],
+              },
+            });
+            await settlePendingTask(localTaskId, "FAILED");
+            if (shouldUseBilling && billingCharge?.chargeId && billingAccount?.accountId) {
+              await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
+                reason: "request_failed",
+                routeId: route.id,
+              });
+            }
+            await completeGenerationRecordFailureSafe({
+              recordId: generationRecord?.id,
+              taskId: localTaskId,
+              errorMessage: failureDetails,
+              outputSize: requestBody.image_size || requestBody.size || null,
+              aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
+              meta: {
+                transport: route.transport,
+                routeMode: "async",
+                upstreamStatus: error.response?.status || null,
+                upstreamError: error.response?.data || null,
+                upstreamContext: error.geminiNative || null,
+              },
+            });
+            logger.error({
+              timestamp: new Date().toISOString(),
+              type: "Gemini Native Background Generate Error",
+              message: failureDetails,
+              stack: error.stack,
+              status: error.response?.status,
+              context: error.geminiNative,
+              response: error.response?.data,
+            });
+          }
+        })();
+
+        return res.json(
+          shouldUseBilling
+            ? {
+                id: localTaskId,
+                task_id: localTaskId,
+                status: "processing",
+                progress: 0,
+                results: [],
+                billing: {
+                  deductedPoints: pointCost,
+                  remainingPoints: billingCharge?.account?.points,
+                },
+              }
+            : {
+                id: localTaskId,
+                task_id: localTaskId,
+                status: "processing",
+                progress: 0,
+                results: [],
+              },
+        );
+      }
 
       try {
         const result = await executeGeminiNativeGenerate({
@@ -3115,29 +3449,40 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
           fallbackAuthorization,
           logTag: "Generate",
         });
+        const resultUrls = extractResultUrlsFromPayload(result);
+        const persistedResult = await persistImageResultPayloadSafe({
+          payload: result,
+          resultUrls,
+          req,
+          billingAccount,
+          generationRecord,
+          route,
+          modelId: requestedImageModel?.id || null,
+        });
         await completeGenerationRecordSuccessSafe({
           recordId: generationRecord?.id,
-          resultUrls: extractResultUrlsFromPayload(result),
+          resultUrls: persistedResult.resultUrls,
+          previewUrl: persistedResult.previewUrl,
           outputSize: requestBody.image_size || requestBody.size || null,
           aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
-          meta: {
+          meta: mergeGeneratedAssetMeta({
             transport: route.transport,
-            routeMode: route.mode,
-          },
+            routeMode: "sync",
+          }, persistedResult),
         });
-        const payload =
+        return res.json(
           shouldUseBilling
             ? {
-                ...result,
+                ...persistedResult.payload,
                 billing: {
                   deductedPoints: pointCost,
                   remainingPoints: billingCharge.account.points,
                 },
               }
-            : result;
-        if (!(await sendSuccessResponse(payload))) return;
-        return;
+            : persistedResult.payload,
+        );
       } catch (error) {
+        const normalizedError = normalizeGenerationError(error);
         if (shouldUseBilling && billingCharge?.chargeId) {
           await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
             reason: "request_failed",
@@ -3146,7 +3491,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
         }
         await completeGenerationRecordFailureSafe({
           recordId: generationRecord?.id,
-          errorMessage: error.message,
+          errorMessage: normalizedError.error,
           outputSize: requestBody.image_size || requestBody.size || null,
           aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
           meta: {
@@ -3159,7 +3504,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
     }
 
     if (!isOpenAiImageRoute(route)) {
-      return sendUserFacingGenerationError(res, 400);
+      return sendUserFacingGenerationError(res, 400, new Error(`图片线路 ${route.id || "unknown"} 不支持 OpenAI 图片请求，请联系管理员`));
     }
 
     const userKey = getRouteAuthorization(route, fallbackAuthorization, {
@@ -3259,7 +3604,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       }
     };
 
-    const isSyncLine = requestBody.isSync === true;
+    const isSyncLine = requestBody.isSync === true || routeMode === "sync";
     if (isSyncLine) {
       delete requestBody.isSync;
     }
@@ -3308,6 +3653,16 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       }
     }
 
+    if (isGptImage2RequestModel(requestBody.model)) {
+      const gptImage2Size = requestBody.size || requestBody.image_size;
+      if (gptImage2Size) {
+        requestBody.size = normalizeGptImage2RequestSize(
+          gptImage2Size,
+          requestBody.aspect_ratio || requestBody.aspectRatio || "1:1",
+        );
+      }
+    }
+
     const grokImageDebug = isGrokModel
       ? {
           imageLen: typeof requestBody.image === "string" ? requestBody.image.length : 0,
@@ -3352,6 +3707,25 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
         messages: [{ role: "user", content: requestBody.prompt }],
         stream: false,
       };
+    } else if (isGptImage2RequestModel(requestBody.model)) {
+      finalRequestBody = {
+        model: requestBody.model,
+        prompt: requestBody.prompt,
+        size: requestBody.size || "auto",
+        quality: requestBody.quality || "auto",
+        output_format: requestBody.output_format || "png",
+        moderation: requestBody.moderation || "auto",
+      };
+
+      if (requestBody.n) finalRequestBody.n = requestBody.n;
+      if (
+        requestBody.output_format &&
+        requestBody.output_format !== "png" &&
+        requestBody.output_compression !== undefined &&
+        requestBody.output_compression !== null
+      ) {
+        finalRequestBody.output_compression = requestBody.output_compression;
+      }
     }
 
     if (shouldUseBilling) {
@@ -3384,7 +3758,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       },
     });
 
-    if (isVisionaryImageRoute(route) && !shouldUseChatSyncEndpoint) {
+    if (isVisionaryImageRoute(route) && isSyncLine && !shouldUseChatSyncEndpoint) {
       const localJobId = createLocalImageJobId();
       localTaskId = buildImageTaskToken(route.id, localJobId);
       setLocalImageJob(localJobId, {
@@ -3410,55 +3784,27 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       }
 
       (async () => {
-        let upstreamTaskId = null;
         try {
-          const visionaryUrl = buildRouteUrl(
-            route,
-            "/openapi/v1/images/generations",
-            { model: requestBody.model },
-          );
-          const visionaryImages = Array.isArray(requestBody.images)
-            ? requestBody.images
-            : Array.isArray(requestBody.image)
-              ? requestBody.image
-              : requestBody.image
-                ? [requestBody.image]
-                : [];
-          const visionaryRequestBody = {
-            prompt: requestBody.prompt,
-            model: requestBody.model,
-            ratio:
-              requestBody.ratio ||
-              requestBody.aspect_ratio ||
-              requestBody.aspectRatio,
-            imageSize:
-              requestBody.imageSize ||
-              requestBody.image_size ||
-              requestBody.size,
-            images: visionaryImages,
-          };
           const response = await requestWithRetry(
             () =>
-              axios.post(visionaryUrl, removeEmptyValues(visionaryRequestBody), {
+              axios.post(upstreamUrl, finalRequestBody, {
                 headers: {
                   Authorization: userKey,
-                  "Idempotency-Key": `img_${localJobId}`,
                   "Content-Type": "application/json",
                 },
                 timeout: 600000,
                 httpsAgent: SHARED_HTTPS_AGENT,
               }),
-            { retries: 1, delayMs: 700, label: `visionary-bg-${route.id}` },
+            { retries: 1, delayMs: 700, label: `generate-bg-${route.id}` },
           );
 
           let settledPayload = response.data;
           let settledStatus = extractResultStatus(settledPayload);
           let resultUrls = extractResultUrlsFromPayload(settledPayload);
-          upstreamTaskId =
+          const upstreamTaskId =
             settledPayload?.id ||
             settledPayload?.task_id ||
-            settledPayload?.data?.task_id ||
-            null;
+            settledPayload?.data?.task_id;
 
           if (
             upstreamTaskId &&
@@ -3496,22 +3842,35 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
             }
           }
 
-          if (
-            resultUrls.length === 0 ||
-            !["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(settledStatus)
-          ) {
+          if (resultUrls.length === 0 || !["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(settledStatus)) {
             throw new Error(
               `Visionary generation did not return an image URL (status: ${settledStatus || "UNKNOWN"})`,
             );
           }
 
-          const successPayload = {
+          let successPayload = {
             ...toImmediateImagePayload(settledPayload),
             id: localTaskId,
             task_id: localTaskId,
             upstream_id: upstreamTaskId || settledPayload?.id || null,
             status: "succeeded",
-            progress: 100,
+          };
+          const persistedResult = await persistImageResultPayloadSafe({
+            payload: successPayload,
+            resultUrls,
+            req,
+            billingAccount,
+            generationRecord,
+            route,
+            modelId: requestedImageModel?.id || null,
+            taskId: localTaskId,
+          });
+          successPayload = {
+            ...persistedResult.payload,
+            id: localTaskId,
+            task_id: localTaskId,
+            upstream_id: upstreamTaskId || settledPayload?.id || null,
+            status: "succeeded",
           };
           setLocalImageJob(localJobId, {
             status: "succeeded",
@@ -3522,37 +3881,36 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
           await completeGenerationRecordSuccessSafe({
             recordId: generationRecord?.id,
             taskId: localTaskId,
-            resultUrls,
-            previewUrl: resultUrls[0] || null,
+            resultUrls: persistedResult.resultUrls,
+            previewUrl: persistedResult.previewUrl,
             outputSize: requestBody.size || requestBody.image_size || null,
             aspectRatio: requestBody.aspect_ratio || null,
-            meta: {
+            meta: mergeGeneratedAssetMeta({
               transport: route.transport,
-              routeMode: isSyncLine ? "sync" : route.mode,
+              routeMode: "sync",
               upstreamStatus: settledStatus,
               settled: "visionary_background_job",
-            },
+            }, persistedResult),
           });
         } catch (error) {
-          const message = error?.response?.data?.error?.message ||
-            error?.response?.data?.error ||
-            error?.response?.data?.message ||
-            error.message ||
-            "Visionary generation failed";
+          const normalizedError = normalizeGenerationError(error);
           setLocalImageJob(localJobId, {
             status: "failed",
             progress: 100,
             responseData: {
               id: localTaskId,
               task_id: localTaskId,
-              upstream_id: upstreamTaskId,
               status: "failed",
-              error: message,
+              error: normalizedError.error,
+              code: normalizedError.code || undefined,
+              statusCode: normalizedError.status,
+              traceId: normalizedError.traceId || undefined,
+              details: normalizedError.details || undefined,
               results: [],
             },
           });
-          const settled = await settlePendingTask(localTaskId, "FAILED");
-          if (!settled && shouldUseBilling && billingCharge?.chargeId && billingAccount?.accountId) {
+          await settlePendingTask(localTaskId, "FAILED");
+          if (shouldUseBilling && billingCharge?.chargeId && billingAccount?.accountId) {
             await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
               reason: "request_failed",
               routeId: route.id,
@@ -3561,40 +3919,39 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
           await completeGenerationRecordFailureSafe({
             recordId: generationRecord?.id,
             taskId: localTaskId,
-            errorMessage: message,
-            meta: {
-              transport: route.transport,
-              routeMode: isSyncLine ? "sync" : route.mode,
-              settled: "visionary_background_job",
-            },
+            errorMessage: normalizedError.error,
           });
           logger.error({
             timestamp: new Date().toISOString(),
             type: "Visionary Background Generate Error",
-            message,
+            message: normalizedError.error,
             stack: error.stack,
             response: error.response?.data,
           });
         }
       })();
 
-      const initialPayload = {
-        id: localTaskId,
-        task_id: localTaskId,
-        status: "processing",
-        progress: 0,
-        results: [],
-        ...(shouldUseBilling
+      return res.json(
+        shouldUseBilling
           ? {
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "processing",
+              progress: 0,
+              results: [],
               billing: {
                 deductedPoints: pointCost,
                 remainingPoints: billingCharge?.account?.points,
               },
             }
-          : {}),
-      };
-      if (!(await sendSuccessResponse(initialPayload))) return;
-      return;
+          : {
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "processing",
+              progress: 0,
+              results: [],
+            },
+      );
     }
 
     const response = await requestWithRetry(
@@ -3610,49 +3967,159 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       { retries: 1, delayMs: 700, label: `generate-${route.id}` },
     );
 
-    if (shouldUseChatSyncEndpoint) {
-      const chatContent = response.data.choices?.[0]?.message?.content || "";
-      console.log("[Generate] Chat response content:", chatContent.substring(0, 100));
-
-      const urlMatch = chatContent.match(/https?:\/\/[^\s^)^>]+/);
-      const syncResultUrl = urlMatch ? urlMatch[0] : chatContent;
-      await completeGenerationRecordSuccessSafe({
-        recordId: generationRecord?.id,
-        resultUrls: syncResultUrl ? [syncResultUrl] : [],
-        previewUrl: syncResultUrl || null,
-        outputSize: requestBody.size || requestBody.image_size || null,
-        aspectRatio: requestBody.aspect_ratio || null,
-        meta: {
-          transport: route.transport,
-          routeMode: "sync",
-        },
-      });
-      if (urlMatch) {
-        const payload =
+    if (isSyncLine) {
+      const syncImmediateResultUrls = extractResultUrlsFromPayload(response.data);
+      const syncUpstreamStatus = extractResultStatus(response.data);
+      if (isImmediateImageResultPayload(response.data, syncImmediateResultUrls)) {
+        const immediatePayload = {
+          ...response.data,
+          url:
+            response.data?.url ||
+            response.data?.image_url ||
+            syncImmediateResultUrls[0] ||
+            null,
+          image_url:
+            response.data?.image_url ||
+            response.data?.url ||
+            syncImmediateResultUrls[0] ||
+            null,
+          images: Array.isArray(response.data?.images)
+            ? response.data.images
+            : syncImmediateResultUrls,
+        };
+        const persistedResult = await persistImageResultPayloadSafe({
+          payload: immediatePayload,
+          resultUrls: syncImmediateResultUrls,
+          req,
+          billingAccount,
+          generationRecord,
+          route,
+          modelId: requestedImageModel?.id || null,
+        });
+        await completeGenerationRecordSuccessSafe({
+          recordId: generationRecord?.id,
+          resultUrls: persistedResult.resultUrls,
+          previewUrl: persistedResult.previewUrl,
+          outputSize: requestBody.size || requestBody.image_size || null,
+          aspectRatio: requestBody.aspect_ratio || null,
+          meta: mergeGeneratedAssetMeta({
+            transport: route.transport,
+            routeMode: "sync",
+            upstreamStatus: syncUpstreamStatus,
+            settled: "sync_immediate_result",
+          }, persistedResult),
+        });
+        return res.json(
           shouldUseBilling
             ? {
-                url: syncResultUrl,
+                ...persistedResult.payload,
                 billing: {
                   deductedPoints: pointCost,
                   remainingPoints: billingCharge?.account?.points,
                 },
               }
-            : { url: urlMatch[0] };
-        if (!(await sendSuccessResponse(payload))) return;
-        return;
+            : persistedResult.payload,
+        );
       }
-      const payload =
-        shouldUseBilling
+
+      const syncUpstreamTaskId =
+        response.data?.id ||
+        response.data?.task_id ||
+        response.data?.data?.task_id;
+      const shouldTreatSyncAsPendingTask =
+        syncUpstreamTaskId &&
+        ["PROCESSING", "PENDING", "RUNNING", "QUEUED", "IN_PROGRESS"].includes(syncUpstreamStatus);
+      if (shouldTreatSyncAsPendingTask) {
+        localTaskId = buildImageTaskToken(route.id, syncUpstreamTaskId);
+        if (shouldUseBilling) {
+          await registerPendingTask(localTaskId, {
+            accountId: billingAccount.accountId,
+            chargeId: billingCharge?.chargeId || null,
+            points: pointCost,
+            routeId: route.id,
+            action: "generate",
+          });
+        }
+        if (generationRecord?.id) {
+          await attachTaskToGenerationRecord(generationRecord.id, localTaskId);
+        }
+
+        const normalizedResponse = shouldUseBilling
           ? {
-              url: syncResultUrl,
+              ...response.data,
+              id: localTaskId,
+              task_id: localTaskId,
               billing: {
                 deductedPoints: pointCost,
                 remainingPoints: billingCharge?.account?.points,
               },
             }
-          : { url: chatContent };
-      if (!(await sendSuccessResponse(payload))) return;
-      return;
+          : {
+              ...response.data,
+              id: localTaskId,
+              task_id: localTaskId,
+            };
+
+        if (normalizedResponse.data && typeof normalizedResponse.data === "object") {
+          normalizedResponse.data = {
+            ...normalizedResponse.data,
+            task_id: localTaskId,
+          };
+        }
+
+        return res.json(normalizedResponse);
+      }
+
+      const chatContent = response.data.choices?.[0]?.message?.content || "";
+      console.log("[Generate] Chat response content:", chatContent.substring(0, 100));
+
+      const urlMatch = chatContent.match(/https?:\/\/[^\s^)^>]+/);
+      const syncResultUrl = urlMatch ? urlMatch[0] : chatContent;
+      const persistedResult = await persistImageResultPayloadSafe({
+        payload: { url: syncResultUrl },
+        resultUrls: syncResultUrl ? [syncResultUrl] : [],
+        req,
+        billingAccount,
+        generationRecord,
+        route,
+        modelId: requestedImageModel?.id || null,
+      });
+      const persistedSyncResultUrl = persistedResult.previewUrl || syncResultUrl;
+      await completeGenerationRecordSuccessSafe({
+        recordId: generationRecord?.id,
+        resultUrls: persistedResult.resultUrls,
+        previewUrl: persistedSyncResultUrl || null,
+        outputSize: requestBody.size || requestBody.image_size || null,
+        aspectRatio: requestBody.aspect_ratio || null,
+        meta: mergeGeneratedAssetMeta({
+          transport: route.transport,
+          routeMode: "sync",
+        }, persistedResult),
+      });
+      if (urlMatch) {
+        return res.json(
+          shouldUseBilling
+            ? {
+                url: persistedSyncResultUrl,
+                billing: {
+                  deductedPoints: pointCost,
+                  remainingPoints: billingCharge?.account?.points,
+                },
+              }
+            : { url: persistedSyncResultUrl },
+        );
+      }
+      return res.json(
+        shouldUseBilling
+          ? {
+              url: persistedSyncResultUrl,
+              billing: {
+                deductedPoints: pointCost,
+                remainingPoints: billingCharge?.account?.points,
+              },
+            }
+          : { url: persistedSyncResultUrl },
+      );
     }
 
     console.log("[Generate] Upstream response:", response.data);
@@ -3662,7 +4129,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       immediateResultUrls.length > 0 &&
       (
         isVisionaryImageRoute(route) ||
-        ["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(upstreamStatus)
+        isImmediateImageResultPayload(response.data, immediateResultUrls)
       );
     if (shouldTreatAsImmediateResult) {
       const immediatePayload = {
@@ -3681,31 +4148,39 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
           ? response.data.images
           : immediateResultUrls,
       };
+      const persistedResult = await persistImageResultPayloadSafe({
+        payload: immediatePayload,
+        resultUrls: immediateResultUrls,
+        req,
+        billingAccount,
+        generationRecord,
+        route,
+        modelId: requestedImageModel?.id || null,
+      });
       await completeGenerationRecordSuccessSafe({
         recordId: generationRecord?.id,
-        resultUrls: immediateResultUrls,
-        previewUrl: immediateResultUrls[0] || null,
+        resultUrls: persistedResult.resultUrls,
+        previewUrl: persistedResult.previewUrl,
         outputSize: requestBody.size || requestBody.image_size || null,
         aspectRatio: requestBody.aspect_ratio || null,
-        meta: {
+        meta: mergeGeneratedAssetMeta({
           transport: route.transport,
           routeMode: route.mode,
           upstreamStatus,
           settled: "immediate_result",
-        },
+        }, persistedResult),
       });
-      const payload =
+      return res.json(
         shouldUseBilling
           ? {
-              ...immediatePayload,
+              ...persistedResult.payload,
               billing: {
                 deductedPoints: pointCost,
                 remainingPoints: billingCharge?.account?.points,
               },
             }
-          : immediatePayload;
-      if (!(await sendSuccessResponse(payload))) return;
-      return;
+          : persistedResult.payload,
+      );
     }
 
     const upstreamTaskId =
@@ -3750,33 +4225,44 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
         };
       }
 
-      if (!(await sendSuccessResponse(normalizedResponse))) return;
-      return;
+      return res.json(normalizedResponse);
     }
 
+    const finalResultUrls = extractResultUrlsFromPayload(response.data);
+    const persistedResult = await persistImageResultPayloadSafe({
+      payload: response.data,
+      resultUrls: finalResultUrls,
+      req,
+      billingAccount,
+      generationRecord,
+      route,
+      modelId: requestedImageModel?.id || null,
+    });
     await completeGenerationRecordSuccessSafe({
       recordId: generationRecord?.id,
-      resultUrls: extractResultUrlsFromPayload(response.data),
+      resultUrls: persistedResult.resultUrls,
+      previewUrl: persistedResult.previewUrl,
       outputSize: requestBody.size || requestBody.image_size || null,
       aspectRatio: requestBody.aspect_ratio || null,
-      meta: {
+      meta: mergeGeneratedAssetMeta({
         transport: route.transport,
         routeMode: route.mode,
-      },
+      }, persistedResult),
     });
 
-    const payload =
+    res.json(
       shouldUseBilling
         ? {
-            ...response.data,
+            ...persistedResult.payload,
             billing: {
               deductedPoints: pointCost,
               remainingPoints: billingCharge?.account?.points,
             },
           }
-        : response.data;
-    if (!(await sendSuccessResponse(payload))) return;
+        : persistedResult.payload,
+    );
   } catch (error) {
+    const normalizedError = normalizeGenerationError(error);
     if (billingCharge?.chargeId && billingAccount?.accountId && !localTaskId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
         reason: "request_failed",
@@ -3786,13 +4272,13 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
     await completeGenerationRecordFailureSafe({
       recordId: generationRecord?.id,
       taskId: localTaskId || null,
-      errorMessage: error.message,
+      errorMessage: normalizedError.error,
     });
-    console.error("[Generate] Error:", error.message);
+    console.error("[Generate] Error:", normalizedError.error);
     logger.error({
       timestamp: new Date().toISOString(),
       type: "Generate Error",
-      message: error.message,
+      message: normalizedError.error,
       stack: error.stack,
       response: error.response?.data,
     });
@@ -3819,7 +4305,7 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
     const shouldUseBilling = !useUserProvidedApiKey;
 
     if (!route) {
-      return sendUserFacingGenerationError(res, 400);
+      return sendUserFacingGenerationError(res, 400, new Error("图片编辑线路不存在或已停用，请联系管理员"));
     }
 
     const pointCost = shouldUseBilling ? getRoutePointCost(route, requestBody.n, requestBody) : 0;
@@ -3836,6 +4322,16 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
       requestedImageModel?.requestModel || requestBody.model,
     );
 
+    if (isGptImage2RequestModel(requestBody.model)) {
+      const gptImage2Size = requestBody.size || requestBody.image_size;
+      if (gptImage2Size) {
+        requestBody.size = normalizeGptImage2RequestSize(
+          gptImage2Size,
+          requestBody.aspect_ratio || requestBody.aspectRatio || "1:1",
+        );
+      }
+    }
+
     console.log("[Edit] Proxying request:", {
       routeId: route.id,
       modelId: requestedImageModel?.id || null,
@@ -3846,29 +4342,88 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
       hasMask: !!requestBody.mask,
     });
 
+    const parseBase64ImageInput = (value, fallbackExt = "png", fallbackMime = "image/png") => {
+      if (typeof value !== "string") return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+
+      const dataUrlMatch = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)$/);
+      if (dataUrlMatch) {
+        const mime = dataUrlMatch[1].toLowerCase();
+        const extMap = {
+          "image/png": "png",
+          "image/jpeg": "jpg",
+          "image/jpg": "jpg",
+          "image/webp": "webp",
+          "image/gif": "gif",
+        };
+        const ext = extMap[mime] || fallbackExt;
+        const buffer = Buffer.from(dataUrlMatch[2].replace(/\s+/g, ""), "base64");
+        return { buffer, mime, ext };
+      }
+
+      return {
+        buffer: Buffer.from(trimmed, "base64"),
+        mime: fallbackMime,
+        ext: fallbackExt,
+      };
+    };
+
+    const appendImageField = (formDataInstance, fieldName, value, index = 0) => {
+      const parsedImage = parseBase64ImageInput(value, "png", "image/png");
+      if (!parsedImage || parsedImage.buffer.length === 0) return false;
+      formDataInstance.append(fieldName, parsedImage.buffer, {
+        filename: `input-${index + 1}.${parsedImage.ext}`,
+        contentType: parsedImage.mime,
+      });
+      return true;
+    };
+
     const formData = new FormData();
     formData.append("model", requestBody.model);
     formData.append("prompt", requestBody.prompt);
 
-    if (requestBody.n) formData.append("n", String(requestBody.n));
-    if (requestBody.size) formData.append("size", requestBody.size);
-    if (requestBody.image_size) formData.append("image_size", requestBody.image_size);
-    if (requestBody.aspect_ratio) formData.append("aspect_ratio", requestBody.aspect_ratio);
+    const isGptImage2Edit = isGptImage2RequestModel(requestBody.model);
+    if (isGptImage2Edit) {
+      if (requestBody.size) formData.append("size", requestBody.size);
+      if (requestBody.quality) formData.append("quality", requestBody.quality);
+      if (requestBody.output_format) formData.append("output_format", requestBody.output_format);
+      if (requestBody.moderation) formData.append("moderation", requestBody.moderation);
+      if (
+        requestBody.output_format &&
+        requestBody.output_format !== "png" &&
+        requestBody.output_compression !== undefined &&
+        requestBody.output_compression !== null
+      ) {
+        formData.append("output_compression", String(requestBody.output_compression));
+      }
 
-    if (requestBody.image) {
-      const imgBuffer = Buffer.from(requestBody.image, "base64");
-      formData.append("image", imgBuffer, {
-        filename: "image.png",
-        contentType: "image/png",
+      const images = Array.isArray(requestBody.images)
+        ? requestBody.images
+        : requestBody.image
+          ? [requestBody.image]
+          : [];
+      images.forEach((value, index) => {
+        appendImageField(formData, "image", value, index);
       });
+    } else {
+      if (requestBody.n) formData.append("n", String(requestBody.n));
+      if (requestBody.size) formData.append("size", requestBody.size);
+      if (requestBody.image_size) formData.append("image_size", requestBody.image_size);
+      if (requestBody.aspect_ratio) formData.append("aspect_ratio", requestBody.aspect_ratio);
+      if (requestBody.image) {
+        appendImageField(formData, "image", requestBody.image, 0);
+      }
     }
 
     if (requestBody.mask) {
-      const maskBuffer = Buffer.from(requestBody.mask, "base64");
-      formData.append("mask", maskBuffer, {
-        filename: "mask.png",
-        contentType: "image/png",
-      });
+      const parsedMask = parseBase64ImageInput(requestBody.mask, "png", "image/png");
+      if (parsedMask && parsedMask.buffer.length > 0) {
+        formData.append("mask", parsedMask.buffer, {
+          filename: `mask.${parsedMask.ext}`,
+          contentType: parsedMask.mime,
+        });
+      }
     }
 
     const authorization = getRouteAuthorization(route, fallbackAuthorization, {
@@ -3901,6 +4456,34 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
     );
 
     console.log("[Edit] Upstream response:", response.data);
+    const editResultUrls = extractResultUrlsFromPayload(response.data);
+    const shouldTreatEditAsImmediateResult =
+      String(route?.mode || "").trim().toLowerCase() === "sync" &&
+      isImmediateImageResultPayload(response.data, editResultUrls);
+    if (shouldTreatEditAsImmediateResult) {
+      const immediatePayload = toImmediateImagePayload(response.data);
+      const persistedResult = await persistImageResultPayloadSafe({
+        payload: immediatePayload,
+        resultUrls: editResultUrls,
+        req,
+        billingAccount,
+        route,
+        modelId: requestedImageModel?.id || null,
+        taskId: localTaskId,
+      });
+      return res.json(
+        shouldUseBilling
+          ? {
+              ...persistedResult.payload,
+              billing: {
+                deductedPoints: pointCost,
+                remainingPoints: billingCharge?.account?.points,
+              },
+            }
+          : persistedResult.payload,
+      );
+    }
+
     const upstreamTaskId =
       response.data?.id ||
       response.data?.task_id ||
@@ -3943,18 +4526,28 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
       return res.json(normalizedResponse);
     }
 
+    const persistedResult = await persistImageResultPayloadSafe({
+      payload: response.data,
+      resultUrls: editResultUrls,
+      req,
+      billingAccount,
+      route,
+      modelId: requestedImageModel?.id || null,
+      taskId: localTaskId,
+    });
     res.json(
       shouldUseBilling
         ? {
-            ...response.data,
+            ...persistedResult.payload,
             billing: {
               deductedPoints: pointCost,
               remainingPoints: billingCharge?.account?.points,
             },
           }
-        : response.data,
+        : persistedResult.payload,
     );
   } catch (error) {
+    const normalizedError = normalizeGenerationError(error);
     if (billingCharge?.chargeId && billingAccount?.accountId && !localTaskId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
         reason: "request_failed",
@@ -4000,112 +4593,150 @@ app.get("/api/proxy/image", async (req, res) => {
   }
 });
 
-app.get("/api/proxy/video", async (req, res) => {
-  const videoUrl = String(req.query.url || "").trim();
-  if (!videoUrl) return res.status(400).send("Url is required");
-  if (!videoUrl.startsWith("http")) {
-    return res.status(400).send("Invalid URL protocol");
-  }
+const isTaskSuccessStatus = (status = "") =>
+  ["SUCCESS", "SUCCEEDED", "COMPLETED"].includes(String(status || "").trim().toUpperCase());
+const isTaskFailureStatus = (status = "") =>
+  ["FAILURE", "FAILED"].includes(String(status || "").trim().toUpperCase());
+const buildImageTaskResponseFromGenerationRecord = (record, taskId) => {
+  if (!record) return null;
 
-  try {
-    console.log("[Video Proxy] Fetching:", videoUrl.substring(0, 120) + "...");
-    const requestHeaders = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  const normalizedTaskId =
+    String(taskId || record.taskId || "").trim() || null;
+  const resultUrls = dedupeResultUrls(record.resultUrls || []);
+  const previewUrl =
+    String(record.previewUrl || "").trim() || resultUrls[0] || null;
+  const originalUrl = resultUrls[0] || previewUrl || null;
+  const normalizedStatus = String(record.status || "").trim().toUpperCase();
+
+  if (normalizedStatus === "SUCCESS") {
+    return {
+      id: normalizedTaskId,
+      task_id: normalizedTaskId,
+      status: "succeeded",
+      progress: 100,
+      results: resultUrls,
+      url: originalUrl,
+      image_url: originalUrl,
+      images: resultUrls,
+      preview_url: previewUrl,
+      thumbnail_url: previewUrl,
+      error: "",
+      failure_reason: "",
     };
-    if (req.headers.range) {
-      requestHeaders.Range = String(req.headers.range);
-    }
-
-    const response = await requestWithRetry(
-      () =>
-        axios.get(videoUrl, {
-          responseType: "stream",
-          timeout: 120000,
-          httpsAgent: SHARED_HTTPS_AGENT,
-          headers: requestHeaders,
-          validateStatus: (status) => status >= 200 && status < 400,
-        }),
-      { retries: 1, delayMs: 500, label: "video-proxy" },
-    );
-
-    const passthroughHeaders = [
-      "content-type",
-      "content-length",
-      "content-range",
-      "accept-ranges",
-      "cache-control",
-      "last-modified",
-      "etag",
-    ];
-    passthroughHeaders.forEach((headerName) => {
-      const headerValue = response.headers[headerName];
-      if (headerValue) {
-        res.setHeader(headerName, headerValue);
-      }
-    });
-    res.setHeader(
-      "Content-Type",
-      response.headers["content-type"] || "video/mp4",
-    );
-    res.setHeader(
-      "Accept-Ranges",
-      response.headers["accept-ranges"] || "bytes",
-    );
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(response.status || 200);
-    response.data.on("error", (streamError) => {
-      console.error("[Video Proxy] Stream Error:", streamError.message);
-      if (!res.headersSent) {
-        res.status(500).end("Video proxy stream failed");
-      } else {
-        res.end();
-      }
-    });
-    response.data.pipe(res);
-  } catch (error) {
-    console.error("[Video Proxy] Error:", error.message);
-    res.status(500).send("Failed to proxy video: " + error.message);
   }
-});
 
-// ==================== Image Task Polling ====================
-app.get("/api/task/:taskId", pollingLimiter, async (req, res) => {
-  try {
-    const fallbackAuthorization = req.headers["authorization"];
-    const encodedTask = String(req.params.taskId || "").trim();
-    const decodedTask = parseImageTaskToken(encodedTask);
-    const route =
-      (decodedTask?.routeId
-        ? await getImageRouteById(decodedTask.routeId, {
-            includeInactive: true,
-            includeSecrets: true,
-          })
-        : null) || (await resolveImageRoute(undefined, { includeInactive: true }));
+  if (normalizedStatus === "FAILED") {
+    return {
+      id: normalizedTaskId,
+      task_id: normalizedTaskId,
+      status: "failed",
+      progress: 100,
+      results: [],
+      error: record.errorMessage || "Image task failed",
+      failure_reason: record.errorMessage || "Image task failed",
+    };
+  }
 
-    const upstreamTaskId = decodedTask?.upstreamTaskId || encodedTask;
-    const localJob = getLocalImageJob(upstreamTaskId);
-    if (localJob) {
-      return res.json(
-        localJob.responseData || {
-          id: encodedTask,
-          task_id: encodedTask,
-          status: localJob.status || "processing",
-          progress: localJob.progress ?? 0,
-          results: localJob.results || [],
-        },
-      );
+  return {
+    id: normalizedTaskId,
+    task_id: normalizedTaskId,
+    status: "processing",
+    progress: 0,
+    results: [],
+    error: "",
+    failure_reason: "",
+  };
+};
+const isVideoPendingTaskEntry = (task = {}) => {
+  const actionName = String(task.actionName || "").trim().toLowerCase();
+  if (actionName.startsWith("video_")) return true;
+  return String(task.routeId || "").trim().toLowerCase().includes("video");
+};
+
+const pollImageTaskAndSettle = async ({
+  encodedTask,
+  fallbackAuthorization = "",
+  req = null,
+  source = "image_task_poll",
+  preferUserProvidedAuth = true,
+} = {}) => {
+  const normalizedTaskId = String(encodedTask || "").trim();
+  if (!normalizedTaskId) {
+    throw new Error("Missing image task id");
+  }
+
+  const decodedTask = parseImageTaskToken(normalizedTaskId);
+  const route =
+    (decodedTask?.routeId
+      ? await getImageRouteById(decodedTask.routeId, {
+          includeInactive: true,
+          includeSecrets: true,
+        })
+      : null) || (await resolveImageRoute(undefined, { includeInactive: true }));
+  if (!route) {
+    throw new Error("Image route not found for task poll");
+  }
+
+  const upstreamTaskId = decodedTask?.upstreamTaskId || normalizedTaskId;
+  const localJob = getLocalImageJob(upstreamTaskId);
+  if (localJob) {
+    return (
+      localJob.responseData || {
+        id: normalizedTaskId,
+        task_id: normalizedTaskId,
+        status: localJob.status || "processing",
+        progress: localJob.progress ?? 0,
+        results: localJob.results || [],
+      }
+    );
+  }
+
+  const generationRecord = await getGenerationRecordByTaskId(normalizedTaskId).catch(() => null);
+  if (
+    generationRecord &&
+    (String(upstreamTaskId).startsWith("local-") || isGeminiNativeRoute(route))
+  ) {
+    return buildImageTaskResponseFromGenerationRecord(generationRecord, normalizedTaskId);
+  }
+
+  const authorization = getRouteAuthorization(route, fallbackAuthorization, {
+    preferUserProvided: preferUserProvidedAuth && shouldUseUserProvidedApiKey(route, fallbackAuthorization),
+  });
+  let responseData = null;
+
+  if (isVisionaryImageRoute(route)) {
+    if (String(upstreamTaskId).startsWith("local-")) {
+      return {
+        id: normalizedTaskId,
+        task_id: normalizedTaskId,
+        status: "processing",
+        progress: 0,
+        results: [],
+        error: "",
+        failure_reason: "",
+      };
     }
 
-    if (!route?.taskPath || !isOpenAiImageRoute(route)) {
-      return sendUserFacingGenerationError(res, 400);
-    }
-
-    const authorization = getRouteAuthorization(route, fallbackAuthorization, {
-      preferUserProvided: shouldUseUserProvidedApiKey(route, fallbackAuthorization),
+    const record = await fetchVisionaryRecordById({
+      route,
+      authorization,
+      upstreamTaskId,
     });
-    const pollUrl = buildRouteUrl(route, route.taskPath, { taskId: upstreamTaskId });
+    responseData =
+      record || {
+        id: upstreamTaskId,
+        results: [],
+        progress: 0,
+        status: "processing",
+        failure_reason: "",
+        error: "",
+      };
+  } else {
+    if (!route.taskPath || !isOpenAiImageRoute(route)) {
+      throw new Error("Image route does not support task polling");
+    }
 
+    const pollUrl = buildRouteUrl(route, route.taskPath, { taskId: upstreamTaskId });
     const response = await requestWithRetry(
       () =>
         axios.get(pollUrl, {
@@ -4118,37 +4749,137 @@ app.get("/api/task/:taskId", pollingLimiter, async (req, res) => {
         }),
       { retries: 2, delayMs: 350, label: `task-poll-${route.id}` },
     );
+    responseData = response.data;
+  }
 
-    const taskStatus = String(
-      response.data?.status || response.data?.state || response.data?.data?.status || "",
-    ).toUpperCase();
-    if (["SUCCESS", "SUCCEEDED", "COMPLETED"].includes(taskStatus)) {
-      await settlePendingTask(encodedTask, "SUCCESS");
-      await completeGenerationRecordSuccessSafe({
-        taskId: encodedTask,
-        resultUrls: extractResultUrlsFromPayload(response.data),
-        meta: {
+  const taskStatus = extractResultStatus(responseData);
+  if (isTaskSuccessStatus(taskStatus)) {
+    const latestGenerationRecord =
+      generationRecord || (await getGenerationRecordByTaskId(normalizedTaskId).catch(() => null));
+    const persistedResult = await persistImageResultPayloadSafe({
+      payload: responseData,
+      resultUrls: extractResultUrlsFromPayload(responseData),
+      req,
+      generationRecord: latestGenerationRecord,
+      route,
+      modelId: latestGenerationRecord?.modelId || null,
+      taskId: normalizedTaskId,
+    });
+    responseData = persistedResult.payload;
+    await settlePendingTask(normalizedTaskId, "SUCCESS");
+    await completeGenerationRecordSuccessSafe({
+      taskId: normalizedTaskId,
+      resultUrls: persistedResult.resultUrls,
+      previewUrl: persistedResult.previewUrl,
+      meta: mergeGeneratedAssetMeta(
+        {
           polledAt: new Date().toISOString(),
-          source: "image_task_poll",
+          source,
         },
-      });
-    } else if (["FAILURE", "FAILED"].includes(taskStatus)) {
-      await settlePendingTask(encodedTask, "FAILED");
-      await completeGenerationRecordFailureSafe({
-        taskId: encodedTask,
-        errorMessage:
-          response.data?.error ||
-          response.data?.message ||
-          response.data?.fail_reason ||
-          "Image task failed",
-        meta: {
-          polledAt: new Date().toISOString(),
-          source: "image_task_poll",
-        },
-      });
-    }
+        persistedResult,
+      ),
+    });
+  } else if (isTaskFailureStatus(taskStatus)) {
+    await settlePendingTask(normalizedTaskId, "FAILED");
+    await completeGenerationRecordFailureSafe({
+      taskId: normalizedTaskId,
+      errorMessage:
+        responseData?.error ||
+        responseData?.message ||
+        responseData?.fail_reason ||
+        "Image task failed",
+      meta: {
+        polledAt: new Date().toISOString(),
+        source,
+      },
+    });
+  }
 
-    res.json(response.data);
+  return responseData;
+};
+
+const pollVideoTaskAndSettle = async ({
+  encodedTaskId,
+  fallbackAuthorization = "",
+  source = "video_task_poll",
+} = {}) => {
+  const normalizedTaskId = String(encodedTaskId || "").trim();
+  if (!normalizedTaskId) {
+    throw new Error("Missing video task id");
+  }
+
+  const decodedTask = parseVideoTaskToken(normalizedTaskId);
+  const route =
+    (decodedTask?.routeId
+      ? await getVideoRouteById(decodedTask.routeId, {
+          includeInactive: true,
+          includeSecrets: true,
+        })
+      : null) || (await resolveVideoRoute(undefined, { includeInactive: true }));
+  if (!route?.taskPath) {
+    throw new Error("Video route does not support task polling");
+  }
+
+  const userKey = getRouteAuthorization(route, fallbackAuthorization, {
+    preferUserProvided: false,
+  });
+  const upstreamTaskId = decodedTask?.upstreamTaskId || normalizedTaskId;
+  const url = buildRouteUrl(route, route.taskPath, { taskId: upstreamTaskId });
+  const response = await requestWithRetry(
+    () =>
+      axios.get(url, {
+        headers: {
+          Authorization: userKey,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+        httpsAgent: SHARED_HTTPS_AGENT,
+      }),
+    { retries: 2, delayMs: 350, label: `video-task-poll-${route.id}` },
+  );
+
+  const responseData = response.data;
+  const taskStatus = extractResultStatus(responseData);
+  if (isTaskSuccessStatus(taskStatus)) {
+    await settlePendingTask(normalizedTaskId, "SUCCESS");
+    await completeGenerationRecordSuccessSafe({
+      taskId: normalizedTaskId,
+      resultUrls: extractResultUrlsFromPayload(responseData),
+      meta: {
+        polledAt: new Date().toISOString(),
+        source,
+      },
+    });
+  } else if (isTaskFailureStatus(taskStatus)) {
+    await settlePendingTask(normalizedTaskId, "FAILED");
+    await completeGenerationRecordFailureSafe({
+      taskId: normalizedTaskId,
+      errorMessage:
+        responseData?.error ||
+        responseData?.message ||
+        responseData?.fail_reason ||
+        "Video task failed",
+      meta: {
+        polledAt: new Date().toISOString(),
+        source,
+      },
+    });
+  }
+
+  return responseData;
+};
+
+// ==================== Image Task Polling ====================
+app.get("/api/task/:taskId", pollingLimiter, async (req, res) => {
+  try {
+    const responseData = await pollImageTaskAndSettle({
+      encodedTask: req.params.taskId,
+      fallbackAuthorization: req.headers["authorization"],
+      req,
+      source: "image_task_poll",
+      preferUserProvidedAuth: true,
+    });
+    res.json(responseData);
   } catch (error) {
     console.error("[Task Poll] Error:", error.message);
     respondWithUserFacingGenerationError(res, error, 500);
@@ -4167,7 +4898,7 @@ app.post("/api/gemini/generate", generateLimiter, async (req, res) => {
     const requestedImageModel = await resolveRequestedImageModel(requestBody);
 
     if (!route || !isGeminiNativeRoute(route)) {
-      return sendUserFacingGenerationError(res, 400);
+      return sendUserFacingGenerationError(res, 400, new Error("Gemini 图片线路不存在、已停用或不支持当前请求，请联系管理员"));
     }
 
     billingAccount = await requireBillingAccount(req);
@@ -4216,26 +4947,38 @@ app.post("/api/gemini/generate", generateLimiter, async (req, res) => {
       fallbackAuthorization,
       logTag: "Gemini Generate",
     });
+    const resultUrls = extractResultUrlsFromPayload(result);
+    const persistedResult = await persistImageResultPayloadSafe({
+      payload: result,
+      resultUrls,
+      req,
+      billingAccount,
+      generationRecord,
+      route,
+      modelId: requestedImageModel?.id || null,
+    });
 
     await completeGenerationRecordSuccessSafe({
       recordId: generationRecord?.id,
-      resultUrls: extractResultUrlsFromPayload(result),
+      resultUrls: persistedResult.resultUrls,
+      previewUrl: persistedResult.previewUrl,
       outputSize: requestBody.image_size || requestBody.size || null,
       aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
-      meta: {
+      meta: mergeGeneratedAssetMeta({
         transport: route.transport,
         routeMode: route.mode,
-      },
+      }, persistedResult),
     });
 
     res.json({
-      ...result,
+      ...persistedResult.payload,
       billing: {
         deductedPoints: pointCost,
         remainingPoints: billingCharge?.account?.points,
       },
     });
   } catch (error) {
+    const normalizedError = normalizeGenerationError(error);
     if (billingCharge?.chargeId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
         reason: "request_failed",
@@ -4244,9 +4987,9 @@ app.post("/api/gemini/generate", generateLimiter, async (req, res) => {
     }
     await completeGenerationRecordFailureSafe({
       recordId: generationRecord?.id,
-      errorMessage: error.message,
+      errorMessage: normalizedError.error,
     });
-    console.error("[Gemini Generate] Error:", error.message);
+    console.error("[Gemini Generate] Error:", normalizedError.error);
     if (error.cause) {
       console.error("[Gemini Generate] Error Cause:", {
         message: error.cause.message,
@@ -4263,7 +5006,7 @@ app.post("/api/gemini/generate", generateLimiter, async (req, res) => {
     logger.error({
       timestamp: new Date().toISOString(),
       type: "Gemini Generate Error",
-      message: error.message,
+      message: normalizedError.error,
       status: error.response?.status,
       response: error.response?.data,
     });
@@ -4279,42 +5022,37 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
   let generationRecord = null;
   try {
     const fallbackAuthorization = req.headers["authorization"];
-    const requestBody = req.body;
+    const requestBody = { ...(req.body || {}) };
     const uiMode = normalizeGenerationUiMode(requestBody?.uiMode);
     const route = await resolveVideoRoute(requestBody?.routeId);
     const requestedVideoModel = await resolveRequestedVideoModel(requestBody);
     if (!route) {
-      return sendUserFacingGenerationError(res, 400);
+      return sendUserFacingGenerationError(res, 400, new Error("视频线路不存在或已停用，请联系管理员"));
     }
+
+    const pointCost = getRoutePointCost(route, 1, requestBody);
+    billingAccount = await requireBillingAccount(req);
+    chargeRouteId = route.id;
 
     delete requestBody.routeId;
     delete requestBody.modelId;
     delete requestBody.uiMode;
-    delete requestBody.authSessionToken;
-    delete requestBody.auth_session_token;
     requestBody.model = getRouteModelName(
       route,
       requestBody,
       requestedVideoModel?.requestModel || requestBody.model,
     );
 
-    const useUserProvidedApiKey = shouldUseUserProvidedApiKey(route, fallbackAuthorization);
-    const shouldUseBilling = !useUserProvidedApiKey;
-    const pointCost = shouldUseBilling ? getRoutePointCost(route, 1, requestBody) : 0;
-    if (shouldUseBilling) {
-      if (!req.authUser?.userId) {
-        console.warn("[Video Generate] Missing billing session", {
-          routeId: route.id,
-          hasHeaderSession: Boolean(req.headers["x-auth-session"]),
-          hasBodySession: Boolean(req.body?.authSessionToken || req.body?.auth_session_token),
-          hasCookieSession: Boolean(getCookieValue(req.headers.cookie, "auth-session-v1")),
-        });
-      }
-      billingAccount = await requireBillingAccount(req);
-      chargeRouteId = route.id;
-    }
     const userKey = getRouteAuthorization(route, fallbackAuthorization, {
-      preferUserProvided: useUserProvidedApiKey,
+      preferUserProvided: false,
+    });
+
+    billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
+      action: "video_generate",
+      routeId: route.id,
+      mode: route.mode,
+      model: requestBody.model,
+      modelId: requestedVideoModel?.id || null,
     });
 
     // Detailed File Logging
@@ -4390,121 +5128,57 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
         duration: requestBody.duration || null,
       },
     });
-    if (shouldUseBilling) {
-      billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
-        action: "video_generate",
-        routeId: route.id,
-        mode: route.mode,
-        model: requestBody.model,
-        modelId: requestedVideoModel?.id || null,
-      });
-    }
-
-    const isGeminiVideoRoute =
-      route?.transport === "gemini-native" || isGeminiNativeStylePath(route);
-    const upstreamModelName = getRouteModelName(
-      route,
-      requestBody,
-      requestBody.model || "veo_3_1_i2v_s_fast_ultra_fl",
-    );
-    const generateEndpoint = isGeminiVideoRoute
-      ? buildRouteUrl(route, route.generatePath || "/v1beta/models/{model}:generateContent", {
-          model: upstreamModelName,
-        })
-      : buildRouteUrl(route, route.generatePath || "/v2/videos/generations");
-    const finalUpstreamBody = isGeminiVideoRoute
-      ? buildGeminiNativeVideoBody({ ...requestBody, model: upstreamModelName })
-      : upstreamBody;
 
     const response = await requestWithRetry(
       () =>
-        axios.post(generateEndpoint, finalUpstreamBody, {
-          headers: {
-            Authorization: userKey,
-            "Content-Type": "application/json",
+        axios.post(
+          buildRouteUrl(route, route.generatePath || "/v2/videos/generations"),
+          upstreamBody,
+          {
+            headers: {
+              Authorization: userKey,
+              "Content-Type": "application/json",
+            },
+            timeout: 900000, // 900 seconds (15 minutes)
+            httpsAgent: SHARED_HTTPS_AGENT,
           },
-          timeout: 900000, // 900 seconds (15 minutes)
-          httpsAgent: SHARED_HTTPS_AGENT,
-        }),
+        ),
       { retries: 1, delayMs: 700, label: `video-generate-${route.id}` },
     );
 
     console.log("[Video Generate] Upstream response:", response.data);
-    const proxiedResponseData = mapResultUrlsInPayload(response.data, (value) =>
-      buildProxyMediaUrlForRequest(req, "video", value),
-    );
-    const immediateResultUrls = extractResultUrlsFromPayload(proxiedResponseData);
-    if (immediateResultUrls.length > 0) {
-      await completeGenerationRecordSuccessSafe({
-        recordId: generationRecord?.id,
-        resultUrls: immediateResultUrls,
-        outputSize:
-          (isGeminiVideoRoute ? null : upstreamBody.resolution) ||
-          (requestBody.hd ? "1080P" : "720P"),
-        aspectRatio: requestBody.aspect_ratio || upstreamBody.ratio || null,
-        meta: {
-          transport: route.transport,
-          routeMode: route.mode,
-          duration: requestBody.duration || null,
-          source: "video_generate_immediate",
-        },
-      });
-
-      const immediateUrl = immediateResultUrls[0];
-      return res.json({
-        ...proxiedResponseData,
-        status: proxiedResponseData?.status || "succeeded",
-        url: proxiedResponseData?.url || immediateUrl,
-        video_url: proxiedResponseData?.video_url || immediateUrl,
-        ...(shouldUseBilling
-          ? {
-              billing: {
-                deductedPoints: pointCost,
-                remainingPoints: billingCharge?.account?.points,
-              },
-            }
-          : {}),
-      });
-    }
-
     const upstreamTaskId =
-      proxiedResponseData?.id ||
-      proxiedResponseData?.task_id ||
-      proxiedResponseData?.data?.task_id ||
-      proxiedResponseData?.name ||
-      proxiedResponseData?.operation?.name ||
-      proxiedResponseData?.data?.name;
+      response.data?.id ||
+      response.data?.task_id ||
+      response.data?.data?.task_id;
 
     if (upstreamTaskId) {
-      localTaskId = buildVideoTaskToken(route.id, upstreamTaskId);
+      const pendingTaskId = buildVideoTaskToken(route.id, upstreamTaskId);
+      await registerPendingTask(pendingTaskId, {
+        accountId: billingAccount.accountId,
+        chargeId: billingCharge?.chargeId || null,
+        points: pointCost,
+        routeId: route.id,
+        action: "video_generate",
+      });
       if (generationRecord?.id) {
-        await attachTaskToGenerationRecord(generationRecord.id, localTaskId);
+        await attachTaskToGenerationRecord(generationRecord.id, pendingTaskId);
       }
-      if (shouldUseBilling) {
-        await registerPendingTask(localTaskId, {
-          accountId: billingAccount.accountId,
-          chargeId: billingCharge?.chargeId || null,
-          points: pointCost,
-          routeId: route.id,
-          action: "video_generate",
-        });
-      }
+      localTaskId = pendingTaskId;
       const normalizedResponse = {
         ...response.data,
         id: localTaskId,
         task_id: localTaskId,
+        billing: {
+          deductedPoints: pointCost,
+          remainingPoints: billingCharge?.account?.points,
+        },
       };
 
       if (normalizedResponse.data && typeof normalizedResponse.data === "object") {
         normalizedResponse.data = {
           ...normalizedResponse.data,
           task_id: localTaskId,
-        };
-      }
-      if (shouldUseBilling) {
-        normalizedResponse.billing = {
-          deductedPoints: pointCost,
-          remainingPoints: billingCharge?.account?.points,
         };
       }
 
@@ -4514,9 +5188,7 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
     await completeGenerationRecordSuccessSafe({
       recordId: generationRecord?.id,
       resultUrls: extractResultUrlsFromPayload(response.data),
-      outputSize:
-        (isGeminiVideoRoute ? null : upstreamBody.resolution) ||
-        (requestBody.hd ? "1080P" : "720P"),
+      outputSize: upstreamBody.resolution || (requestBody.hd ? "1080P" : "720P"),
       aspectRatio: requestBody.aspect_ratio || upstreamBody.ratio || null,
       meta: {
         transport: route.transport,
@@ -4525,17 +5197,13 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
       },
     });
 
-    res.json(
-      shouldUseBilling
-        ? {
-            ...response.data,
-            billing: {
-              deductedPoints: pointCost,
-              remainingPoints: billingCharge?.account?.points,
-            },
-          }
-        : response.data,
-    );
+    res.json({
+      ...response.data,
+      billing: {
+        deductedPoints: pointCost,
+        remainingPoints: billingCharge?.account?.points,
+      },
+    });
   } catch (error) {
     if (billingCharge?.chargeId && billingAccount?.accountId && !localTaskId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
@@ -4546,15 +5214,9 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
     await completeGenerationRecordFailureSafe({
       recordId: generationRecord?.id,
       taskId: localTaskId || null,
-      errorMessage: error.message,
+      errorMessage: normalizedError.error,
     });
-    console.error("[Video Generate] Error:", error.message);
-    if (error.response?.data) {
-      console.error(
-        "[Video Generate] Upstream response:",
-        JSON.stringify(error.response.data),
-      );
-    }
+    console.error("[Video Generate] Error:", normalizedError.error);
     respondWithUserFacingGenerationError(res, error, 500);
   }
 });
@@ -4562,88 +5224,19 @@ app.post("/api/video/generate", generateLimiter, async (req, res) => {
 // ==================== Video Task Polling ====================
 app.get("/api/video/task/:taskId", pollingLimiter, async (req, res) => {
   try {
-    const fallbackAuthorization = req.headers["authorization"];
-    const encodedTaskId = String(req.params.taskId || "").trim();
-    const decodedTask = parseVideoTaskToken(encodedTaskId);
-    const route =
-      (decodedTask?.routeId
-        ? await getVideoRouteById(decodedTask.routeId, {
-            includeInactive: true,
-            includeSecrets: true,
-          })
-        : null) || (await resolveVideoRoute(undefined, { includeInactive: true }));
-
-    if (!route?.taskPath) {
-      return sendUserFacingGenerationError(res, 400);
-    }
-
-    const useUserProvidedApiKey = shouldUseUserProvidedApiKey(
-      route,
-      fallbackAuthorization,
-    );
-    const userKey = getRouteAuthorization(route, fallbackAuthorization, {
-      preferUserProvided: useUserProvidedApiKey,
+    await requireBillingAccount(req);
+    const responseData = await pollVideoTaskAndSettle({
+      encodedTaskId: req.params.taskId,
+      fallbackAuthorization: req.headers["authorization"],
+      source: "video_task_poll",
     });
-    const upstreamTaskId = decodedTask?.upstreamTaskId || encodedTaskId;
-    const url = buildRouteUrl(route, route.taskPath, { taskId: upstreamTaskId });
-    console.log(`[Video Task Poll] Requesting: ${url}`);
-
-    const response = await requestWithRetry(
-      () =>
-        axios.get(url, {
-          headers: {
-            Authorization: userKey,
-            "Content-Type": "application/json",
-          },
-          timeout: 10000,
-          httpsAgent: SHARED_HTTPS_AGENT,
-        }),
-      { retries: 2, delayMs: 350, label: `video-task-poll-${route.id}` },
-    );
-
     logger.info({
       timestamp: new Date().toISOString(),
       type: "Poll Response",
-      taskId: upstreamTaskId,
-      responsePreview: JSON.stringify(response.data).substring(0, 1000),
+      taskId: String(req.params.taskId || "").trim(),
+      responsePreview: JSON.stringify(responseData).substring(0, 1000),
     });
-
-    console.log(
-      "[Video Task Poll] Response:",
-      JSON.stringify(response.data).substring(0, 500),
-    );
-
-    const proxiedResponseData = mapResultUrlsInPayload(response.data, (value) =>
-      buildProxyMediaUrlForRequest(req, "video", value),
-    );
-    const taskStatus = extractResultStatus(proxiedResponseData);
-    if (["SUCCESS", "SUCCEEDED", "COMPLETED"].includes(taskStatus)) {
-      await settlePendingTask(encodedTaskId, "SUCCESS");
-      await completeGenerationRecordSuccessSafe({
-        taskId: encodedTaskId,
-        resultUrls: extractResultUrlsFromPayload(proxiedResponseData),
-        meta: {
-          polledAt: new Date().toISOString(),
-          source: "video_task_poll",
-        },
-      });
-    } else if (["FAILURE", "FAILED"].includes(taskStatus)) {
-      await settlePendingTask(encodedTaskId, "FAILED");
-      await completeGenerationRecordFailureSafe({
-        taskId: encodedTaskId,
-        errorMessage:
-          proxiedResponseData?.error ||
-          proxiedResponseData?.message ||
-          proxiedResponseData?.fail_reason ||
-          "Video task failed",
-        meta: {
-          polledAt: new Date().toISOString(),
-          source: "video_task_poll",
-        },
-      });
-    }
-
-    res.json(proxiedResponseData);
+    res.json(responseData);
   } catch (error) {
     console.error("[Video Task Poll] Error:", error.message);
     respondWithUserFacingGenerationError(res, error, 500);
@@ -4651,23 +5244,64 @@ app.get("/api/video/task/:taskId", pollingLimiter, async (req, res) => {
 });
 
 // ==================== Shared Prompt Tool Helpers ====================
-// Shared model fallback for prompt tools
-const GEMINI_FALLBACK_MODELS = [
-  "gemini-3.1-pro-preview",
-  "gemini-3-po-preview",
-  "gemini-3-flash-preview",
-];
-const PROMPT_OPTIMIZE_POINT_COST = 0.5;
-const REVERSE_PROMPT_POINT_COST = 0.5;
+const PROMPT_TOOL_DEFAULT_MODEL = "gemini-3.1-pro-preview";
+const getPromptToolModel = () =>
+  String(process.env.PROMPT_TOOL_MODEL || PROMPT_TOOL_DEFAULT_MODEL).trim() ||
+  PROMPT_TOOL_DEFAULT_MODEL;
+const getPromptOptimizeCost = () =>
+  Math.max(0, toPointNumber(process.env.PROMPT_OPTIMIZE_COST || "0.5", 0.5));
+const getReversePromptCost = () =>
+  Math.max(0, toPointNumber(process.env.REVERSE_PROMPT_COST || "1", 1));
+const getPromptToolAuthorization = () => {
+  const authorization = normalizeAuthorization(process.env.GEMINI_API_KEY || "");
+  if (!authorization) {
+    throw new Error("GEMINI_API_KEY is not configured on the server");
+  }
+  return authorization;
+};
 
 function buildGeminiGenerateEndpoint(model) {
-  return `https://api.bltcy.ai/v1beta/models/${model}:generateContent`;
+  const baseUrl = trimTrailingSlash(process.env.GEMINI_API_BASE_URL || UPSTREAM_URL);
+  return `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 }
 
-async function postGeminiWithFallback({
+const parseGeminiJsonText = (rawText) => {
+  let cleaned = String(rawText || "").trim();
+  if (cleaned.startsWith("```json")) cleaned = cleaned.slice(7);
+  else if (cleaned.startsWith("```")) cleaned = cleaned.slice(3);
+  if (cleaned.endsWith("```")) cleaned = cleaned.slice(0, -3);
+  return JSON.parse(cleaned.trim());
+};
+
+const parseDataUrlForPromptTool = (value) => {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=\r\n]+)$/i);
+  if (match) {
+    const mimeType = match[1].toLowerCase() === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+    return {
+      mimeType,
+      data: match[2].replace(/\s+/g, ""),
+    };
+  }
+  return {
+    mimeType: "image/jpeg",
+    data: raw.replace(/\s+/g, ""),
+  };
+};
+
+app.get("/api/prompt-tools/config", (req, res) => {
+  res.json({
+    success: true,
+    model: getPromptToolModel(),
+    optimizeCost: getPromptOptimizeCost(),
+    reverseCost: getReversePromptCost(),
+  });
+});
+
+async function postGeminiWithModels({
   models,
   payload,
-  userKey,
+  authorization,
   timeout,
   logTag,
   extraAxiosConfig = {},
@@ -4683,7 +5317,7 @@ async function postGeminiWithFallback({
             payload,
             {
               headers: {
-                Authorization: userKey,
+                Authorization: authorization,
                 "Content-Type": "application/json",
               },
               timeout,
@@ -4709,101 +5343,75 @@ async function postGeminiWithFallback({
   throw lastError;
 }
 
-const resolvePromptToolAuthorization = async () => {
-  const directGeminiKey = normalizeAuthorization(process.env.GEMINI_API_KEY);
-  if (directGeminiKey) {
-    return directGeminiKey;
-  }
-
-  const route = await resolveImageRoute(undefined, { includeInactive: true });
-  return getRouteAuthorization(route, null);
-};
-
 app.post("/api/optimize-prompt", async (req, res) => {
   let billingAccount = null;
   let billingCharge = null;
+  const pointCost = getPromptOptimizeCost();
+  const modelName = getPromptToolModel();
   try {
-    billingAccount = await requireBillingAccount(req);
-
     const { prompt, type = "IMAGE" } = req.body || {};
     if (!prompt || !String(prompt).trim()) {
       return res.status(400).json({ error: "Prompt is required" });
     }
-    const userKey = await resolvePromptToolAuthorization();
-    billingCharge = await reservePoints(
-      billingAccount.accountId,
-      PROMPT_OPTIMIZE_POINT_COST,
-      {
-        action: "prompt_optimize",
-        routeId: "prompt-tools",
-        mode: "sync",
-        model: GEMINI_FALLBACK_MODELS[0],
-      },
-    );
 
-    const geminiModels = [...GEMINI_FALLBACK_MODELS];
+    billingAccount = await requireBillingAccount(req);
+    const authorization = getPromptToolAuthorization();
+    billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
+      action: "prompt_optimize",
+      model: modelName,
+      type: String(type || "IMAGE").toUpperCase(),
+      prompt: String(prompt).slice(0, 240),
+    });
+
     const isVideo = String(type).toUpperCase() === "VIDEO";
     const systemInstruction = isVideo
       ? "You are a professional video prompt optimizer. Return exactly 3 Chinese prompt options in JSON array format: [{\"style\":\"...\",\"prompt\":\"...\"}]. No markdown."
       : "You are a professional image prompt optimizer. Return exactly 3 Chinese prompt options in JSON array format: [{\"style\":\"...\",\"prompt\":\"...\"}]. No markdown.";
 
-    const { response, model: usedModel } = await postGeminiWithFallback({
-      models: geminiModels,
+    const { response, model: usedModel } = await postGeminiWithModels({
+      models: [modelName],
       payload: {
         contents: [{ parts: [{ text: String(prompt) }] }],
         systemInstruction: { parts: [{ text: systemInstruction }] },
       },
-      userKey,
+      authorization,
       timeout: 30000,
       logTag: "Optimize",
     });
 
-    if (usedModel !== geminiModels[0]) {
-      console.log(`[Optimize] Fallback model in use: ${usedModel}`);
-    }
-
     const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) {
-      return res.status(500).json({ error: "Optimize failed: empty response" });
+      throw new Error("Optimize failed: empty response");
     }
 
     let options;
     try {
-      let cleaned = String(rawText).trim();
-      if (cleaned.startsWith("```json")) cleaned = cleaned.slice(7);
-      else if (cleaned.startsWith("```")) cleaned = cleaned.slice(3);
-      if (cleaned.endsWith("```")) cleaned = cleaned.slice(0, -3);
-      cleaned = cleaned.trim();
-      options = JSON.parse(cleaned);
+      options = parseGeminiJsonText(rawText);
       if (!Array.isArray(options) || options.length === 0) throw new Error("Invalid options format");
     } catch (parseError) {
-      return res.json({
-        success: true,
-        options: [{ style: "优化结果", prompt: String(rawText).trim() }],
-        billing: {
-          deductedPoints: PROMPT_OPTIMIZE_POINT_COST,
-          remainingPoints: billingCharge?.account?.points,
-        },
-      });
+      options = [{ style: "优化结果", prompt: String(rawText).trim() }];
     }
 
     return res.json({
       success: true,
-      options,
+      model: usedModel,
+      cost: pointCost,
       billing: {
-        deductedPoints: PROMPT_OPTIMIZE_POINT_COST,
+        deductedPoints: pointCost,
         remainingPoints: billingCharge?.account?.points,
       },
+      options,
     });
   } catch (error) {
+    console.error("[Optimize] Error:", error.message);
     if (billingCharge?.chargeId && billingAccount?.accountId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
-        reason: "request_failed",
-        routeId: "prompt-tools",
+        reason: "prompt_optimize_failed",
+        model: modelName,
+      }).catch((refundError) => {
+        console.error("[Optimize] Refund failed:", refundError.message);
       });
     }
-    console.error("[Optimize] Error:", error.message);
-    if (sendAuthError(res, error)) return;
     if (sendBillingError(res, error)) return;
     if (error.response) {
       return res
@@ -4821,41 +5429,57 @@ app.post("/api/optimize-prompt", async (req, res) => {
 app.post("/api/reverse-prompt", async (req, res) => {
   let billingAccount = null;
   let billingCharge = null;
+  const pointCost = getReversePromptCost();
+  const modelName = getPromptToolModel();
   try {
-    billingAccount = await requireBillingAccount(req);
-
     const image = req.body?.image;
     if (!image) {
       return res.status(400).json({ error: "Image is required" });
     }
-    const userKey = await resolvePromptToolAuthorization();
-    billingCharge = await reservePoints(
-      billingAccount.accountId,
-      REVERSE_PROMPT_POINT_COST,
-      {
-        action: "reverse_prompt",
-        routeId: "prompt-tools",
-        mode: "sync",
-        model: GEMINI_FALLBACK_MODELS[0],
-      },
-    );
 
-    const base64Image = String(image).replace(/^data:image\/(png|jpeg|webp);base64,/, "");
-    const geminiModels = [...GEMINI_FALLBACK_MODELS];
-    const systemInstruction =
-      "You are a senior visual designer. Analyze the input image and output one detailed Chinese generation prompt. Output plain text only.";
+    billingAccount = await requireBillingAccount(req);
+    const authorization = getPromptToolAuthorization();
+    billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
+      action: "reverse_prompt",
+      model: modelName,
+    });
 
-    const { response, model: usedModel } = await postGeminiWithFallback({
-      models: geminiModels,
+    const parsedImage = parseDataUrlForPromptTool(image);
+    const systemInstruction = [
+      "You are a professional image prompt engineer for commercial AI image generation.",
+      "Your task is not to casually describe the image. You must reverse-engineer it into a production-ready image generation prompt.",
+      "Analyze the image through these layers: subject, identity/role, pose/action, expression, clothing, scene, era/location, foreground/background, composition, camera angle, lens/framing, lighting, color palette, texture/materials, artistic medium, rendering style, mood, quality modifiers, and negative prompt.",
+      "Return JSON only. Do not use markdown. Do not add explanations outside JSON.",
+      "The exact JSON shape must be:",
+      "{\"plainPrompt\":\"...\",\"jsonPrompt\":{\"subject\":\"...\",\"coreDescription\":\"...\",\"scene\":\"...\",\"composition\":\"...\",\"camera\":\"...\",\"lighting\":\"...\",\"colorPalette\":\"...\",\"style\":\"...\",\"medium\":\"...\",\"textureAndDetails\":[\"...\"],\"qualityModifiers\":[\"...\"],\"negativePrompt\":\"...\",\"englishPrompt\":\"...\"}}",
+      "Rules for plainPrompt:",
+      "1. Write in Chinese.",
+      "2. It must be a fluent professional generation prompt, not a bullet list.",
+      "3. Put important visual elements first, then scene, composition, light, style, quality details.",
+      "4. Avoid uncertain wording like '可能', '似乎', '看起来'. Use confident prompt language.",
+      "5. Keep concrete visual details from the image, but do not identify real people.",
+      "6. Include professional image-generation words such as composition, lighting, lens/framing, material texture, art style, high-detail quality where appropriate.",
+      "Rules for jsonPrompt:",
+      "1. Every field must be useful for generation.",
+      "2. textureAndDetails and qualityModifiers must be arrays of concise Chinese phrases.",
+      "3. englishPrompt should be an English professional prompt equivalent to plainPrompt for models that perform better in English.",
+      "4. negativePrompt should include common visual defects to avoid, adapted to the image style.",
+    ].join(" ");
+
+    const { response, model: usedModel } = await postGeminiWithModels({
+      models: [modelName],
       payload: {
         contents: [
           {
             parts: [
-              { text: "Generate one detailed Chinese prompt from this image." },
+              {
+                text:
+                  "请按专业生图提示词结构逆推这张图片。输出必须包含：一段可直接复制使用的中文普通提示词，以及结构化 JSON 提示词。不要只描述画面，要把它改写成高质量生图提示词。",
+              },
               {
                 inline_data: {
-                  mime_type: "image/jpeg",
-                  data: base64Image,
+                  mime_type: parsedImage.mimeType,
+                  data: parsedImage.data,
                 },
               },
             ],
@@ -4863,7 +5487,7 @@ app.post("/api/reverse-prompt", async (req, res) => {
         ],
         systemInstruction: { parts: [{ text: systemInstruction }] },
       },
-      userKey,
+      authorization,
       timeout: 300000,
       logTag: "Reverse",
       extraAxiosConfig: {
@@ -4872,32 +5496,62 @@ app.post("/api/reverse-prompt", async (req, res) => {
       },
     });
 
-    if (usedModel !== geminiModels[0]) {
-      console.log(`[Reverse] Fallback model in use: ${usedModel}`);
-    }
-
     const resultPrompt = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!resultPrompt) {
-      return res.status(500).json({ error: "Reverse failed: empty response" });
+      throw new Error("Reverse failed: empty response");
+    }
+
+    let plainPrompt = String(resultPrompt).trim();
+    let jsonPrompt = {
+      subject: "",
+      coreDescription: "",
+      scene: "",
+      composition: "",
+      camera: "",
+      lighting: "",
+      colorPalette: "",
+      style: "",
+      medium: "",
+      textureAndDetails: [],
+      qualityModifiers: [],
+      negativePrompt: "",
+      englishPrompt: "",
+    };
+    try {
+      const parsed = parseGeminiJsonText(resultPrompt);
+      plainPrompt = String(parsed?.plainPrompt || parsed?.prompt || plainPrompt).trim();
+      if (parsed?.jsonPrompt && typeof parsed.jsonPrompt === "object") {
+        jsonPrompt = parsed.jsonPrompt;
+      }
+    } catch (_) {
+      jsonPrompt = {
+        ...jsonPrompt,
+        subject: plainPrompt,
+      };
     }
 
     return res.json({
       success: true,
-      prompt: String(resultPrompt).trim(),
+      model: usedModel,
+      cost: pointCost,
       billing: {
-        deductedPoints: REVERSE_PROMPT_POINT_COST,
+        deductedPoints: pointCost,
         remainingPoints: billingCharge?.account?.points,
       },
+      prompt: plainPrompt,
+      plainPrompt,
+      jsonPrompt,
     });
   } catch (error) {
+    console.error("[Reverse] Error:", error.message);
     if (billingCharge?.chargeId && billingAccount?.accountId) {
       await refundPoints(billingAccount.accountId, billingCharge.chargeId, {
-        reason: "request_failed",
-        routeId: "prompt-tools",
+        reason: "reverse_prompt_failed",
+        model: modelName,
+      }).catch((refundError) => {
+        console.error("[Reverse] Refund failed:", refundError.message);
       });
     }
-    console.error("[Reverse] Error:", error.message);
-    if (sendAuthError(res, error)) return;
     if (sendBillingError(res, error)) return;
     if (error.response) {
       return res
@@ -5199,11 +5853,129 @@ app.delete("/api/announcement/:id", async (req, res) => {
   }
 });
 
+const BACKGROUND_TASK_SETTLEMENT_ENABLED =
+  String(process.env.BACKGROUND_TASK_SETTLEMENT_ENABLED || "true").trim().toLowerCase() !== "false";
+const BACKGROUND_TASK_SETTLEMENT_INTERVAL_MS = Math.max(
+  5000,
+  readPositiveIntEnv("BACKGROUND_TASK_SETTLEMENT_INTERVAL_MS", 300000),
+);
+const BACKGROUND_TASK_SETTLEMENT_BATCH_SIZE = Math.max(
+  1,
+  readPositiveIntEnv("BACKGROUND_TASK_SETTLEMENT_BATCH_SIZE", 10),
+);
+let backgroundTaskSettlementRunning = false;
+
+const runBackgroundTaskSettlement = async () => {
+  if (!BACKGROUND_TASK_SETTLEMENT_ENABLED || backgroundTaskSettlementRunning) {
+    return;
+  }
+
+  backgroundTaskSettlementRunning = true;
+  try {
+    const pendingTasks = await listPendingTasks({
+      status: "PENDING",
+      limit: BACKGROUND_TASK_SETTLEMENT_BATCH_SIZE,
+    });
+    if (!pendingTasks.length) {
+      return;
+    }
+    logger.info({
+      timestamp: new Date().toISOString(),
+      type: "Background Task Settlement Batch",
+      pendingCount: pendingTasks.length,
+    });
+
+    for (const task of pendingTasks) {
+      if (!task?.taskId) continue;
+      try {
+        let responseData = null;
+        if (isVideoPendingTaskEntry(task)) {
+          responseData = await pollVideoTaskAndSettle({
+            encodedTaskId: task.taskId,
+            source: "background_video_task_poll",
+          });
+        } else {
+          responseData = await pollImageTaskAndSettle({
+            encodedTask: task.taskId,
+            source: "background_image_task_poll",
+            preferUserProvidedAuth: false,
+          });
+        }
+        const settledStatus = extractResultStatus(responseData);
+        if (isTaskSuccessStatus(settledStatus) || isTaskFailureStatus(settledStatus)) {
+          logger.info({
+            timestamp: new Date().toISOString(),
+            type: "Background Task Settled",
+            taskId: task.taskId,
+            routeId: task.routeId || null,
+            actionName: task.actionName || null,
+            status: settledStatus,
+          });
+        }
+      } catch (error) {
+        logger.warn({
+          timestamp: new Date().toISOString(),
+          type: "Background Task Settlement Warning",
+          taskId: task.taskId,
+          routeId: task.routeId || null,
+          actionName: task.actionName || null,
+          message: error.message,
+        });
+      }
+    }
+  } finally {
+    backgroundTaskSettlementRunning = false;
+  }
+};
+
+const startBackgroundTaskSettlement = () => {
+  if (!BACKGROUND_TASK_SETTLEMENT_ENABLED) {
+    console.log("[Background Settlement] Disabled");
+    return;
+  }
+
+  setTimeout(() => {
+    void runBackgroundTaskSettlement();
+  }, 5000);
+  setInterval(() => {
+    void runBackgroundTaskSettlement();
+  }, BACKGROUND_TASK_SETTLEMENT_INTERVAL_MS);
+  console.log(
+    `[Background Settlement] Enabled: every ${BACKGROUND_TASK_SETTLEMENT_INTERVAL_MS}ms, batch ${BACKGROUND_TASK_SETTLEMENT_BATCH_SIZE}`,
+  );
+};
+
 // ==================== Static Files ====================
+app.use(
+  "/generated-assets/line4",
+  express.static(path.join(__dirname, "storage", "line4"), {
+    maxAge: "5d",
+    immutable: false,
+    setHeaders: (res) => {
+      res.setHeader("Cache-Control", "public, max-age=432000");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    },
+  }),
+);
+app.use(
+  "/generated-assets",
+  express.static(LINE4_LOCAL_STORAGE_ROOT, {
+    maxAge: "5d",
+    immutable: false,
+    setHeaders: (res) => {
+      res.setHeader("Cache-Control", "public, max-age=432000");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    },
+  }),
+);
 app.use('/uploads', express.static(ANNOUNCEMENT_UPLOAD_ROOT));
 app.use(express.static(path.join(__dirname, 'dist')));
 
 app.get(['/create/classic', '/create/classic/'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'classic-app', 'index.html'));
+});
+
+app.get(['/vip', '/vip/'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'classic-app', 'index.html'));
 });
 
@@ -5225,4 +5997,7 @@ app.get("/{*splat}", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
   console.log(`   Upstream API: ${UPSTREAM_URL}`);
+  startBackgroundTaskSettlement();
+  startBillingMaintenance(logger);
+  startGenerationRecordMaintenance(logger);
 });

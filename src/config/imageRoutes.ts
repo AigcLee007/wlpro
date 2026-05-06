@@ -57,38 +57,7 @@ export interface ImageRouteOption {
   isDirectUserApiKeyCompatible?: boolean;
 }
 
-const EMPTY_IMAGE_ROUTE: ImageRouteConfig = {
-  id: '__no_image_route__',
-  label: 'No Route',
-  description: 'No active route is available.',
-  modelFamily: 'default',
-  line: 'default',
-  transport: 'openai-image',
-  mode: 'async',
-  baseUrl: '',
-  generatePath: '/v1/images/generations',
-  taskPath: '',
-  editPath: '',
-  chatPath: '',
-  upstreamModel: '',
-  useRequestModel: true,
-  allowUserApiKeyWithoutLogin: false,
-  apiKeyEnv: '',
-  pointCost: 0,
-  sizeOverrides: {},
-  isActive: false,
-  isDefaultRoute: false,
-  isDefaultNanoBananaLine: false,
-  sortOrder: Number.MAX_SAFE_INTEGER,
-  hasApiKey: false,
-  createdAt: null,
-  updatedAt: null,
-};
-
-const API_BASE_URL =
-  typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3355/api'
-    : '/api';
+const API_BASE_URL = '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 
@@ -159,7 +128,7 @@ const normalizeRoute = (route: Partial<ImageRouteConfig> = {}): ImageRouteConfig
 const normalizeCatalog = (
   input: Partial<ImageRouteCatalogShape> | null | undefined,
 ): ImageRouteCatalogShape => {
-  const routes = Array.isArray(input?.routes)
+  const normalizedRoutes = Array.isArray(input?.routes)
     ? input!.routes
         .map((route) => normalizeRoute(route))
         .filter((route) => route.id)
@@ -170,6 +139,15 @@ const normalizeCatalog = (
           return left.label.localeCompare(right.label);
         })
     : [];
+  const gptImage2CanonicalIds = new Set(['gpt-image-2-default', 'gpt-image-2-line2']);
+  const hasCanonicalGptImage2Routes = normalizedRoutes.some((route) =>
+    gptImage2CanonicalIds.has(route.id),
+  );
+  const routes = hasCanonicalGptImage2Routes
+    ? normalizedRoutes.filter(
+        (route) => route.modelFamily !== 'gpt-image-2' || gptImage2CanonicalIds.has(route.id),
+      )
+    : normalizedRoutes;
 
   const defaultRouteId =
     String(input?.defaultRouteId || '').trim() ||
@@ -256,8 +234,7 @@ export const getImageRouteById = (routeId?: string): ImageRouteConfig => {
   return (
     IMAGE_ROUTES().find((route) => route.id === routeId) ||
     IMAGE_ROUTES().find((route) => route.id === DEFAULT_IMAGE_ROUTE_ID()) ||
-    IMAGE_ROUTES()[0] ||
-    EMPTY_IMAGE_ROUTE
+    IMAGE_ROUTES()[0]
   );
 };
 
@@ -268,15 +245,15 @@ const buildUserFacingRouteLabel = (line: string, fallbackLabel?: string) => {
   const normalizedLine = String(line || '').trim().toLowerCase();
   const lineMatch = normalizedLine.match(/^line\s*([0-9]+)$/i);
   if (lineMatch?.[1]) {
-    return `Line ${lineMatch[1]}`;
+    return `线路 ${lineMatch[1]}`;
   }
 
   if (normalizedLine === 'default') {
-    return 'Default';
+    return '默认';
   }
 
   const sanitizedFallback = String(fallbackLabel || '').trim();
-  return sanitizedFallback || 'Route';
+  return sanitizedFallback || '线路';
 };
 
 export const getNanoBananaRouteByLine = (line?: string): ImageRouteConfig => {
@@ -316,6 +293,41 @@ export const getSelectedImageRoute = (
   );
 };
 
+export const getLowestCostImageRouteForModel = (
+  imageModel: string,
+  imageSize?: string,
+  {
+    directKeyOnly = false,
+  }: {
+    directKeyOnly?: boolean;
+  } = {},
+): ImageRouteConfig | null => {
+  const modelConfig = getImageModelById(imageModel);
+  const routeFamily = String(modelConfig?.routeFamily || 'default').trim() || 'default';
+  const familyRoutes = getImageRoutesByModelFamily(routeFamily).filter((route) => {
+    if (route.isActive === false) return false;
+    return directKeyOnly ? route.allowUserApiKeyWithoutLogin === true : true;
+  });
+
+  if (familyRoutes.length === 0) return null;
+
+  return [...familyRoutes].sort((left, right) => {
+    const leftCost = getImageRoutePointCost(left, imageSize);
+    const rightCost = getImageRoutePointCost(right, imageSize);
+    if (leftCost !== rightCost) return leftCost - rightCost;
+
+    const leftDefault = left.isDefaultRoute || left.isDefaultNanoBananaLine ? 1 : 0;
+    const rightDefault = right.isDefaultRoute || right.isDefaultNanoBananaLine ? 1 : 0;
+    if (leftDefault !== rightDefault) return rightDefault - leftDefault;
+
+    if ((left.sortOrder || 0) !== (right.sortOrder || 0)) {
+      return (left.sortOrder || 0) - (right.sortOrder || 0);
+    }
+
+    return left.label.localeCompare(right.label);
+  })[0];
+};
+
 export const getImageRouteOptions = (
   imageModel: string,
   {
@@ -334,9 +346,10 @@ export const getImageRouteOptions = (
     return [];
   }
 
-  const familyRoutes = getImageRoutesByModelFamily(routeFamily).filter((route) =>
-    directKeyOnly ? route.allowUserApiKeyWithoutLogin === true : true,
-  );
+  const familyRoutes = getImageRoutesByModelFamily(routeFamily).filter((route) => {
+    if (route.isActive === false) return false;
+    return directKeyOnly ? route.allowUserApiKeyWithoutLogin === true : true;
+  });
   if (familyRoutes.length <= 1) {
     return [];
   }
@@ -368,7 +381,7 @@ export const canUseDirectUserApiKeyForImageModel = (imageModel: string): boolean
   if (!routeFamily) return false;
 
   return getImageRoutesByModelFamily(routeFamily).some(
-    (route) => route.allowUserApiKeyWithoutLogin === true,
+    (route) => route.isActive !== false && route.allowUserApiKeyWithoutLogin === true,
   );
 };
 
@@ -398,6 +411,21 @@ export const getImageRoutePointCost = (
     return roundNonNegativePoint(sizeOverride.pointCost, 0);
   }
   return roundNonNegativePoint(route?.pointCost || 0, 0);
+};
+
+export const getImageRouteSizeOptions = (
+  route?: ImageRouteConfig | null,
+  modelSizeOptions: string[] = [],
+): string[] => {
+  const options = modelSizeOptions.length > 0 ? modelSizeOptions : ['1k'];
+  const routeSizeKeys = Object.keys(route?.sizeOverrides || {}).filter((value) =>
+    normalizeSizeKey(value),
+  );
+  if (!route || routeSizeKeys.length === 0) return options;
+
+  const allowed = new Set([...routeSizeKeys, 'auto']);
+  const filtered = options.filter((value) => allowed.has(String(value || '').trim().toLowerCase()));
+  return filtered.length > 0 ? filtered : options;
 };
 
 export const getImageModelNameForRoute = ({

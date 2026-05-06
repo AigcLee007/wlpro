@@ -1,4 +1,4 @@
-import { getAuthorizedBillingHeaders } from './accountIdentity';
+﻿import { getAuthorizedBillingHeaders } from './accountIdentity';
 import {
   refreshImageModelCatalog,
   type ImageModelCatalogShape,
@@ -10,7 +10,7 @@ import {
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -127,3 +127,4 @@ export const deleteAdminImageModel = async (
   await refreshImageModelCatalog().catch(() => undefined);
   return data;
 };
+

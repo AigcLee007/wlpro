@@ -1,16 +1,17 @@
 import React from 'react';
 import SettingsModal from '../../components/SettingsModal';
 import ReversePromptModal from '../../components/ReversePromptModal';
+import BatchProcessModal from '../../components/BatchProcessModal';
 import InstructionsModal from '../../components/InstructionsModal';
 import ContextMenu from '../../components/ContextMenu';
 import AnnouncementPopup from '../../components/AnnouncementPopup';
 import { X } from 'lucide-react';
-import { looksLikeVideoUrl, normalizeVideoDeliveryUrl } from '../services/videoService';
 
 interface ModalsContainerProps {
   settingsOpen: boolean;
   settingsTab: 'settings' | 'history';
   onCloseSettings: () => void;
+  onOpenSettings?: () => void;
   onReusePrompt: (prompt: string, type: 'image' | 'video') => void;
   onViewImage: (src: string) => void;
   onUseAsReference: (src: string) => void;
@@ -19,6 +20,12 @@ interface ModalsContainerProps {
   reversePromptOpen: boolean;
   onCloseReversePrompt: () => void;
   onUsePrompt: (prompt: string) => void;
+
+  batchModalOpen: boolean;
+  onCloseBatchModal: () => void;
+  batchApiKey: string | null;
+  onInitGenerations: (count: number, prompt: string, aspectRatio?: string, baseNode?: any, type?: 'IMAGE' | 'VIDEO') => string[];
+  onUpdateGeneration: (id: string, src: string | null, error?: string, taskId?: string) => void;
 
   instructionsOpen: boolean;
   onCloseInstructions: () => void;
@@ -41,6 +48,7 @@ export const ModalsContainer: React.FC<ModalsContainerProps> = ({
   settingsOpen,
   settingsTab,
   onCloseSettings,
+  onOpenSettings,
   onReusePrompt,
   onViewImage,
   onUseAsReference,
@@ -48,6 +56,11 @@ export const ModalsContainer: React.FC<ModalsContainerProps> = ({
   reversePromptOpen,
   onCloseReversePrompt,
   onUsePrompt,
+  batchModalOpen,
+  onCloseBatchModal,
+  batchApiKey,
+  onInitGenerations,
+  onUpdateGeneration,
   instructionsOpen,
   onCloseInstructions,
   lightboxImage,
@@ -62,7 +75,7 @@ export const ModalsContainer: React.FC<ModalsContainerProps> = ({
 }) => {
   return (
     <>
-      <AnnouncementPopup />
+      <AnnouncementPopup onOpenSettings={onOpenSettings} />
       <SettingsModal
         isOpen={settingsOpen}
         initialTab={settingsTab}
@@ -79,6 +92,14 @@ export const ModalsContainer: React.FC<ModalsContainerProps> = ({
         onUsePrompt={onUsePrompt}
       />
 
+      <BatchProcessModal
+        isOpen={batchModalOpen}
+        onClose={onCloseBatchModal}
+        apiKey={batchApiKey}
+        onInitGenerations={onInitGenerations}
+        onUpdateGeneration={onUpdateGeneration}
+      />
+
       <InstructionsModal
         isOpen={instructionsOpen}
         onClose={onCloseInstructions}
@@ -88,9 +109,9 @@ export const ModalsContainer: React.FC<ModalsContainerProps> = ({
         <div className="fixed inset-0 z-[70] bg-black/90 backdrop-blur-md flex items-center justify-center p-8" onClick={onCloseLightbox}>
           <button onClick={onCloseLightbox} className="absolute top-4 right-4 p-2 text-white/70 hover:text-white bg-white/10 rounded-full"><X size={24} /></button>
           
-          {looksLikeVideoUrl(lightboxImage) ? (
+          {(lightboxImage.toLowerCase().endsWith('.mp4') || lightboxImage.toLowerCase().includes('format=mp4')) ? (
              <video 
-               src={normalizeVideoDeliveryUrl(lightboxImage)} 
+               src={lightboxImage} 
                className="max-w-full max-h-full object-contain shadow-2xl rounded-sm"
                controls
                autoPlay

@@ -30,8 +30,10 @@ export interface NodeData {
 
   // Image/Video specific
   src?: string; // Video URL for video nodes
+  thumbnailSrc?: string;
   assetId?: string; // ID for Blob storage (IndexedDB)
   prompt?: string;
+  createdAt?: string; // ISO timestamp for generated/imported asset display
 
   // Video specific
   videoModel?: string;
@@ -58,6 +60,9 @@ export interface NodeData {
   // Image History
   history?: HistoryItem[];
   historyIndex?: number;
+
+  // Derived image-edit results
+  sourceNodeId?: string;
 }
 
 export enum ToolMode {

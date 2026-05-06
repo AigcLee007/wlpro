@@ -1,4 +1,4 @@
-import { getAuthorizedBillingHeaders } from './accountIdentity';
+﻿import { getAuthorizedBillingHeaders } from './accountIdentity';
 import {
   refreshVideoRouteCatalog,
   type VideoRouteCatalogShape,
@@ -7,7 +7,7 @@ import {
 
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -30,7 +30,7 @@ export interface AdminVideoRoutePayload {
   description?: string;
   routeFamily: string;
   line: string;
-  transport: 'openai-video' | 'gemini-native';
+  transport: 'openai-video';
   mode: 'async';
   baseUrl: string;
   generatePath: string;
@@ -106,3 +106,4 @@ export const deleteAdminVideoRoute = async (
   await refreshVideoRouteCatalog().catch(() => undefined);
   return data;
 };
+

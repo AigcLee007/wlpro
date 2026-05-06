@@ -1,5 +1,5 @@
 {
-  "name": "Copy of Magic Image",
-  "description": "An infinite canvas for generative art. Generate, edit, and arrange AI-created images on a boundless workspace using Gemini 2.5 Flash Image.",
+  "name": "武陵商厦创作平台",
+  "description": "武陵商厦企业内部 AI 创作平台，用于活动海报、商品视觉、门店物料和宣传素材生成。",
   "requestFramePermissions": []
 }

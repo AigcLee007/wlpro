@@ -14,13 +14,16 @@ const BILLING_FILE = path.join(__dirname, "billing-data.json");
 const BILLING_VERSION = 1;
 const LEDGER_LIMIT = 5000;
 const SETTLED_TASK_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const PENDING_TASK_TIMEOUT_MS =
+const PENDING_TASK_TIMEOUT_MINUTES = () =>
   Math.max(
-    5,
-    Number.parseInt(String(process.env.PENDING_TASK_TIMEOUT_MINUTES || "30"), 10) || 30,
-  ) *
-  60 *
-  1000;
+    10,
+    Number.parseInt(String(process.env.BILLING_PENDING_TASK_TIMEOUT_MINUTES || "90"), 10) || 90,
+  );
+const VIDEO_PENDING_TASK_TIMEOUT_MINUTES = () =>
+  Math.max(
+    PENDING_TASK_TIMEOUT_MINUTES(),
+    Number.parseInt(String(process.env.BILLING_VIDEO_PENDING_TASK_TIMEOUT_MINUTES || "360"), 10) || 360,
+  );
 
 class BillingError extends Error {
   constructor(code, message, extra = {}) {
@@ -117,31 +120,34 @@ const cleanupStore = (store) => {
   }
 
   const now = Date.now();
-  Object.entries(store.pendingTasks || {}).forEach(([taskId, task]) => {
-    if (!task) return;
-    const isPending = String(task.status || "").toUpperCase() === "PENDING" && !task.settledAt;
-    const createdAtMs = Date.parse(String(task.createdAt || ""));
-    if (!isPending || !Number.isFinite(createdAtMs)) return;
-    if (now - createdAtMs < PENDING_TASK_TIMEOUT_MS) return;
-
-    const refund = refundChargeInStore(store, task.accountId, task.chargeId, {
-      reason: "task_timeout_auto_refund",
-      taskId,
-      routeId: task.routeId,
-      action: task.action,
-    });
-    task.status = "FAILED";
-    task.settledAt = new Date().toISOString();
-    task.refundId = refund?.refundId || null;
-    task.refundedAt = refund?.account?.updatedAt || null;
-  });
-
   Object.keys(store.pendingTasks).forEach((taskId) => {
     const task = store.pendingTasks[taskId];
     if (!task) return;
     if (task.settledAt && now - new Date(task.settledAt).getTime() > SETTLED_TASK_RETENTION_MS) {
       delete store.pendingTasks[taskId];
     }
+  });
+};
+
+const expireStalePendingTasksInStore = (store) => {
+  const now = Date.now();
+  const imageTimeoutMs = PENDING_TASK_TIMEOUT_MINUTES() * 60 * 1000;
+  const videoTimeoutMs = VIDEO_PENDING_TASK_TIMEOUT_MINUTES() * 60 * 1000;
+
+  Object.entries(store.pendingTasks || {}).forEach(([taskId, task]) => {
+    if (!task || String(task.status || "").toUpperCase() !== "PENDING" || task.settledAt) {
+      return;
+    }
+    const createdAtMs = Date.parse(task.createdAt || "");
+    if (!Number.isFinite(createdAtMs)) return;
+    const routeId = String(task.routeId || "").toLowerCase();
+    const timeoutMs = routeId.includes("video") ? videoTimeoutMs : imageTimeoutMs;
+    if (now - createdAtMs < timeoutMs) return;
+
+    task.status = "STALE";
+    task.settledAt = new Date(now).toISOString();
+    task.refundId = null;
+    task.refundedAt = null;
   });
 };
 
@@ -559,7 +565,32 @@ const buildAdminBillingOverviewFromStore = (store, { recentWindowHours = 24 } = 
 };
 
 const getAdminBillingOverview = ({ recentWindowHours = 24 } = {}) =>
-  withStore((store) => buildAdminBillingOverviewFromStore(store, { recentWindowHours }));
+  withStore((store) => {
+    expireStalePendingTasksInStore(store);
+    return buildAdminBillingOverviewFromStore(store, { recentWindowHours });
+  });
+
+const listPendingTasks = ({ status = "PENDING", limit = 50 } = {}) =>
+  withStore((store) => {
+    expireStalePendingTasksInStore(store);
+    const normalizedStatus = String(status || "PENDING").trim().toUpperCase();
+    const safeLimit = Math.min(200, Math.max(1, Number.parseInt(String(limit || 50), 10) || 50));
+    return Object.entries(store.pendingTasks || {})
+      .map(([taskId, task]) => ({
+        taskId,
+        accountId: String(task?.accountId || "").trim() || null,
+        chargeId: String(task?.chargeId || "").trim() || null,
+        points: toPointNumber(task?.points || 0, 0),
+        routeId: String(task?.routeId || "").trim() || null,
+        actionName: String(task?.action || task?.actionName || "").trim() || null,
+        createdAt: String(task?.createdAt || "").trim() || null,
+        settledAt: String(task?.settledAt || "").trim() || null,
+        status: String(task?.status || "").trim().toUpperCase() || "PENDING",
+      }))
+      .filter((task) => task.status === normalizedStatus && !task.settledAt)
+      .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+      .slice(0, safeLimit);
+  });
 
 const reservePoints = (accountId, points, meta = {}) =>
   withStore((store) => {
@@ -685,79 +716,6 @@ const settlePendingTask = (taskId, status) =>
     }
 
     return task;
-  });
-
-const scanAndCompensateAbnormalOrders = ({
-  pendingTimeoutMinutes = Number.parseInt(String(process.env.PENDING_TASK_TIMEOUT_MINUTES || "30"), 10) || 30,
-  limit = 500,
-} = {}) =>
-  withStore((store) => {
-    const safeTimeoutMinutes = Math.max(5, Number.parseInt(String(pendingTimeoutMinutes || 30), 10) || 30);
-    const safeLimit = Math.min(2000, Math.max(1, Number.parseInt(String(limit || 500), 10) || 500));
-    const cutoffMs = Date.now() - safeTimeoutMinutes * 60 * 1000;
-
-    const candidates = Object.entries(store.pendingTasks || {})
-      .map(([taskId, task]) => ({ taskId, task }))
-      .filter(({ task }) => {
-        if (!task) return false;
-        const status = String(task.status || "").toUpperCase();
-        const createdAtMs = Date.parse(String(task.createdAt || ""));
-        const isTimedOutPending =
-          status === "PENDING" &&
-          !task.settledAt &&
-          Number.isFinite(createdAtMs) &&
-          createdAtMs < cutoffMs;
-        const isFailedMissingRefund =
-          status === "FAILED" &&
-          task.chargeId &&
-          !task.refundId;
-        return isTimedOutPending || isFailedMissingRefund;
-      })
-      .sort((a, b) => {
-        const left = Date.parse(String(a.task?.createdAt || "")) || 0;
-        const right = Date.parse(String(b.task?.createdAt || "")) || 0;
-        return left - right;
-      })
-      .slice(0, safeLimit);
-
-    let scanned = 0;
-    let compensated = 0;
-    let alreadySettled = 0;
-    const refundedTaskIds = [];
-    const failedTaskIds = [];
-
-    for (const { taskId, task } of candidates) {
-      scanned += 1;
-      const refund = refundChargeInStore(store, task.accountId, task.chargeId, {
-        reason: "manual_compensation_scan",
-        taskId,
-        routeId: task.routeId,
-        action: task.action,
-      });
-
-      if (!refund) {
-        alreadySettled += 1;
-      } else {
-        compensated += 1;
-        refundedTaskIds.push(taskId);
-      }
-
-      task.status = "FAILED";
-      task.settledAt = task.settledAt || new Date().toISOString();
-      if (refund?.refundId) task.refundId = refund.refundId;
-      if (refund?.account?.updatedAt) task.refundedAt = refund.account.updatedAt;
-      failedTaskIds.push(taskId);
-    }
-
-    return {
-      success: true,
-      scanned,
-      compensated,
-      alreadySettled,
-      pendingTimeoutMinutes: safeTimeoutMinutes,
-      refundedTaskIds,
-      failedTaskIds,
-    };
   });
 
 const rechargeAccount = (accountId, points, note = "") =>
@@ -997,14 +955,15 @@ module.exports = {
   requireBillingAccount,
   getAccountSummary,
   getBillingPricing,
+  listPendingTasks,
   reservePoints,
   refundPoints,
   registerPendingTask,
-  scanAndCompensateAbnormalOrders,
   settlePendingTask,
   rechargeAccount,
   adjustAccountPoints,
   createRedeemCodes,
   listRedeemCodes,
   redeemCode,
+  startBillingMaintenance: () => null,
 };

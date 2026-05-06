@@ -44,33 +44,7 @@ export interface ImageModelCatalogShape {
   models: ImageModelConfig[];
 }
 
-const EMPTY_IMAGE_MODEL: ImageModelConfig = {
-  id: '__no_image_model__',
-  label: 'No Image Model',
-  description: 'No active image model is available.',
-  modelFamily: 'default',
-  routeFamily: 'default',
-  requestModel: '',
-  selectorCost: 0,
-  iconKind: 'none',
-  panelLayout: 'default',
-  sizeBehavior: 'passthrough',
-  defaultSize: '1k',
-  sizeOptions: ['1k'],
-  extraAspectRatios: [],
-  showSizeSelector: true,
-  supportsCustomRatio: true,
-  isActive: false,
-  isDefaultModel: false,
-  sortOrder: Number.MAX_SAFE_INTEGER,
-  createdAt: null,
-  updatedAt: null,
-};
-
-const API_BASE_URL =
-  typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3355/api'
-    : '/api';
+const API_BASE_URL = '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
 const normalizeStringArray = (value: unknown): string[] => {
@@ -207,8 +181,7 @@ export const getImageModelById = (modelId?: string): ImageModelConfig => {
   return (
     IMAGE_MODELS().find((model) => model.id === modelId) ||
     IMAGE_MODELS().find((model) => model.id === DEFAULT_IMAGE_MODEL_ID()) ||
-    IMAGE_MODELS()[0] ||
-    EMPTY_IMAGE_MODEL
+    IMAGE_MODELS()[0]
   );
 };
 

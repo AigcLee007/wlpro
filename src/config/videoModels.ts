@@ -1,4 +1,4 @@
-import videoModelCatalog from '../../config/videoModels.json';
+﻿import videoModelCatalog from '../../config/videoModels.json';
 import { roundNonNegativePoint } from '../utils/pointFormat';
 
 export interface VideoModelConfig {
@@ -29,32 +29,9 @@ export interface VideoModelCatalogShape {
   models: VideoModelConfig[];
 }
 
-const EMPTY_VIDEO_MODEL: VideoModelConfig = {
-  id: '__no_video_model__',
-  label: 'No Video Model',
-  description: 'No active video model is available.',
-  modelFamily: 'default',
-  routeFamily: 'default',
-  requestModel: '',
-  selectorCost: 0,
-  maxReferenceImages: 0,
-  referenceLabels: [],
-  defaultAspectRatio: '16:9',
-  aspectRatioOptions: ['16:9'],
-  defaultDuration: '4',
-  durationOptions: ['4'],
-  supportsHd: false,
-  defaultHd: false,
-  isActive: false,
-  isDefaultModel: false,
-  sortOrder: Number.MAX_SAFE_INTEGER,
-  createdAt: null,
-  updatedAt: null,
-};
-
 const API_BASE_URL =
   typeof window !== 'undefined' && window.location.hostname === 'localhost'
-    ? 'http://localhost:3325/api'
+    ? 'http://localhost:3355/api'
     : '/api';
 
 const cleanUrl = (url: string) => url.replace(/\/$/, '');
@@ -77,9 +54,6 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
 export const normalizeVideoModelId = (modelId?: string) =>
   LEGACY_MODEL_ALIASES[String(modelId || '').trim()] || String(modelId || '').trim();
 
-const getModelMinReferenceImages = (modelId?: string) =>
-  normalizeVideoModelId(modelId) === 'grok-video-3' ? 10 : 0;
-
 const normalizeModel = (model: Partial<VideoModelConfig> = {}): VideoModelConfig => ({
   id: normalizeVideoModelId(model.id),
   label: String(model.label || model.id || 'Video Model').trim(),
@@ -88,10 +62,7 @@ const normalizeModel = (model: Partial<VideoModelConfig> = {}): VideoModelConfig
   routeFamily: String(model.routeFamily || model.modelFamily || 'default').trim(),
   requestModel: String(model.requestModel || '').trim(),
   selectorCost: roundNonNegativePoint(model.selectorCost || 0, 0),
-  maxReferenceImages: Math.max(
-    getModelMinReferenceImages(model.id),
-    Number(model.maxReferenceImages || 1),
-  ),
+  maxReferenceImages: Math.max(0, Number(model.maxReferenceImages || 1)),
   referenceLabels: normalizeStringArray(model.referenceLabels || []),
   defaultAspectRatio: String(model.defaultAspectRatio || '16:9').trim(),
   aspectRatioOptions: normalizeStringArray(model.aspectRatioOptions || ['16:9', '9:16']),
@@ -189,8 +160,7 @@ export const getVideoModelById = (modelId?: string): VideoModelConfig => {
   return (
     VIDEO_MODELS().find((model) => model.id === normalized) ||
     VIDEO_MODELS().find((model) => model.id === DEFAULT_VIDEO_MODEL_ID()) ||
-    VIDEO_MODELS()[0] ||
-    EMPTY_VIDEO_MODEL
+    VIDEO_MODELS()[0]
   );
 };
 
@@ -202,10 +172,7 @@ export const getDefaultVideoAspectRatioForModel = (modelId?: string) =>
 export const getDefaultVideoDurationForModel = (modelId?: string) =>
   getVideoModelById(modelId).defaultDuration || getVideoModelDurationOptions(modelId)[0] || '4';
 export const getVideoModelMaxReferenceImages = (modelId?: string) =>
-  Math.max(
-    getModelMinReferenceImages(modelId),
-    Number(getVideoModelById(modelId).maxReferenceImages || 1),
-  );
+  Math.max(0, Number(getVideoModelById(modelId).maxReferenceImages || 1));
 export const getVideoModelReferenceLabels = (modelId?: string) => getVideoModelById(modelId).referenceLabels || [];
 export const getVideoModelSupportsHd = (modelId?: string) => getVideoModelById(modelId).supportsHd === true;
 export const getVideoModelDefaultHd = (modelId?: string) => getVideoModelById(modelId).defaultHd === true;
@@ -215,3 +182,4 @@ export const getVideoModelRequestName = (modelId?: string) => {
   const model = getVideoModelById(modelId);
   return model.requestModel || model.id;
 };
+

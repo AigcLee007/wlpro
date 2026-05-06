@@ -3,9 +3,10 @@
 // --- 核心配置 ---
 const CONFIG = {
   submitUrl: "/api/generate",
-  queryUrl: "/api/check/{id}",
+  queryUrl: "/api/task/{id}",
   model: "nano-banana-2",
 };
+const CLASSIC_VIP_MODE = window.__CLASSIC_VIP_MODE__ === true;
 let refImages = [];
 let smartRatio = null;
 let progressInterval = null;
@@ -15,14 +16,93 @@ let suppressThumbPreviewUntil = 0;
 let historyObjectUrls = [];
 const GROK_REF_MODE_KEY = "nb_grok_ref_mode";
 const PromptTagsUtil = window.PromptTagsUtil || null;
-const MAX_REF_IMAGES = 10;
+const DEFAULT_MAX_REF_IMAGES = 10;
+const GPT_MAX_REF_IMAGES = 16;
+const GPT_IMAGE_QUALITY_KEY = "classic_gpt_image_quality";
+const GPT_IMAGE_OUTPUT_FORMAT_KEY = "classic_gpt_image_output_format";
+const GPT_IMAGE_OUTPUT_COMPRESSION_KEY = "classic_gpt_image_output_compression";
+const GPT_IMAGE_MODERATION_KEY = "classic_gpt_image_moderation";
+const GPT_IMAGE_DEFAULTS = {
+  quality: "auto",
+  outputFormat: "png",
+  outputCompression: null,
+  moderation: "auto",
+};
 const NOTICE_READ_TS_KEY = "nb_notice_last_read_ts";
 const NOTICE_POPUP_DISMISSED_KEY = "nb_notice_popup_dismissed_id";
 const CREATE_MODE_STORAGE_KEY = "preferred-create-ui";
+const PRICE_LINE_ALL = "__all__";
+const AUTH_SESSION_STORAGE_KEY = "auth-session-v1";
 
 try {
   localStorage.setItem(CREATE_MODE_STORAGE_KEY, "classic");
 } catch (_) {}
+
+if (CLASSIC_VIP_MODE) {
+  window.addEventListener("DOMContentLoaded", () => {
+    document.body?.classList.add("classic-vip-mode");
+    document.title = "武陵商厦创作平台";
+  });
+}
+
+let classicPricingCatalog = {
+  models: [
+    {
+      id: "nano-banana",
+      label: "Nano Banana Pro",
+      routeFamily: "nano-banana",
+      sizeOptions: ["1k", "2k", "4k"],
+      defaultSize: "2k",
+      selectorCost: 5,
+    },
+    {
+      id: "gemini-flash",
+      label: "Nano Banana 2",
+      routeFamily: "default",
+      sizeOptions: ["1k", "2k", "4k"],
+      defaultSize: "2k",
+      selectorCost: 2.5,
+    },
+    {
+      id: "gpt-image-2",
+      label: "GPT-image-2",
+      routeFamily: "gpt-image-2",
+      sizeOptions: ["auto", "1k", "2k", "4k"],
+      defaultSize: "auto",
+      selectorCost: 1,
+    },
+  ],
+  routes: [
+    { id: "nano-banana-pro-line1", label: "Line 1", modelFamily: "nano-banana", line: "line1", pointCost: 10 },
+    { id: "nano-banana-pro-line2", label: "Line 2", modelFamily: "nano-banana", line: "line2", pointCost: 18 },
+    { id: "nano-banana-pro-line3", label: "Line 3", modelFamily: "nano-banana", line: "line3", pointCost: 20 },
+    {
+      id: "nano-banana-pro-line4",
+      label: "Line 4",
+      modelFamily: "nano-banana",
+      line: "line4",
+      pointCost: 5,
+      sizeOverrides: {
+        "1k": { pointCost: 4 },
+        "2k": { pointCost: 4.5 },
+        "4k": { pointCost: 5 },
+      },
+    },
+    { id: "openai-image-default", label: "Default Route", modelFamily: "default", line: "default", pointCost: 12 },
+    {
+      id: "gpt-image-2-default",
+      label: "Default Route",
+      modelFamily: "gpt-image-2",
+      line: "default",
+      pointCost: 1,
+      sizeOverrides: {
+        "1k": { upstreamModel: "gpt-image-2-all", pointCost: 1 },
+        "2k": { upstreamModel: "gpt-image-2", pointCost: 2 },
+        "4k": { upstreamModel: "gpt-image-2", pointCost: 4 },
+      },
+    },
+  ],
+};
 
 const HISTORY_CACHE_DB = "nb_history_cache_db";
 const HISTORY_CACHE_STORE = "images";
@@ -124,6 +204,729 @@ function genHistoryId() {
   return `h_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function isClassicLine4LocalOriginal(url) {
+  return (
+    typeof url === "string" &&
+    (url.includes("/generated-assets/original/") ||
+      url.includes("/generated-assets/line4/original/"))
+  );
+}
+
+function getClassicLine4ThumbUrl(url) {
+  if (!isClassicLine4LocalOriginal(url)) return "";
+  return String(url)
+    .replace("/generated-assets/original/", "/generated-assets/thumb/")
+    .replace("/generated-assets/line4/original/", "/generated-assets/line4/thumb/")
+    .replace(/\.[a-zA-Z0-9]+(?=$|[?#])/, ".webp");
+}
+
+function getHistoryFullUrl(item) {
+  if (typeof item === "string") return item;
+  return String(item?.fullUrl || item?.url || "").trim();
+}
+
+function getHistoryDisplayUrl(item) {
+  if (typeof item === "string") return item;
+  return String(item?.previewUrl || item?.displayUrl || item?.url || "").trim();
+}
+
+const CLASSIC_LIVE_TASKS_KEY = "nb_classic_live_tasks_v1";
+const CLASSIC_LIVE_MAX_TASKS = 30;
+const CLASSIC_LIVE_TTL_MS = 120 * 60 * 60 * 1000;
+let classicLiveTasks = [];
+let classicLiveSelectedId = "";
+let classicLiveResizeTimer = null;
+
+function makeClassicLiveId() {
+  return `live_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function normalizeClassicLiveTask(task = {}) {
+  const createdAt = Number(task.createdAt || task.submittedAt || Date.now());
+  return {
+    id: String(task.id || task.tempId || task.taskId || makeClassicLiveId()),
+    tempId: String(task.tempId || ""),
+    taskId: String(task.taskId || ""),
+    status: String(task.status || "running"),
+    prompt: String(task.prompt || ""),
+    modelLabel: String(task.modelLabel || task.model || ""),
+    routeLabel: String(task.routeLabel || task.route || ""),
+    size: String(task.size || ""),
+    ratio: String(task.ratio || ""),
+    index: Number(task.index || 1),
+    quantity: Number(task.quantity || 1),
+    referenceCount: Number(task.referenceCount || 0),
+    originalUrl: String(task.originalUrl || task.fullUrl || task.resultUrl || task.url || ""),
+    previewUrl: String(task.previewUrl || task.thumbnailUrl || ""),
+    errorMessage: String(task.errorMessage || ""),
+    createdAt,
+    completedAt: task.completedAt ? Number(task.completedAt) : 0,
+    updatedAt: Number(task.updatedAt || Date.now()),
+  };
+}
+
+function readClassicLiveTasks() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CLASSIC_LIVE_TASKS_KEY) || "[]");
+    const now = Date.now();
+    classicLiveTasks = (Array.isArray(raw) ? raw : [])
+      .map(normalizeClassicLiveTask)
+      .filter((task) => now - Number(task.createdAt || now) < CLASSIC_LIVE_TTL_MS)
+      .slice(0, CLASSIC_LIVE_MAX_TASKS);
+  } catch (_) {
+    classicLiveTasks = [];
+  }
+}
+
+function persistClassicLiveTasks() {
+  try {
+    classicLiveTasks = classicLiveTasks
+      .map(normalizeClassicLiveTask)
+      .sort((a, b) => Number(b.updatedAt || b.createdAt) - Number(a.updatedAt || a.createdAt))
+      .slice(0, CLASSIC_LIVE_MAX_TASKS);
+    localStorage.setItem(CLASSIC_LIVE_TASKS_KEY, JSON.stringify(classicLiveTasks));
+  } catch (_) {}
+}
+
+function findClassicLiveTaskIndex(idOrTaskId) {
+  const id = String(idOrTaskId || "").trim();
+  if (!id) return -1;
+  return classicLiveTasks.findIndex(
+    (task) => task.id === id || task.tempId === id || task.taskId === id,
+  );
+}
+
+function getClassicLiveFullUrl(task = {}) {
+  return String(task.originalUrl || task.fullUrl || task.resultUrl || task.url || "").trim();
+}
+
+function getClassicLivePreviewUrl(task = {}) {
+  const fullUrl = getClassicLiveFullUrl(task);
+  return String(task.previewUrl || task.thumbnailUrl || getClassicLine4ThumbUrl(fullUrl) || "").trim();
+}
+
+function formatClassicLiveClock(value) {
+  const date = new Date(Number(value || Date.now()));
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  const hm = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (sameDay) return hm;
+  return `${date.getMonth() + 1}/${date.getDate()} ${hm}`;
+}
+
+function getClassicLiveStatusLabel(status) {
+  if (status === "success") return "已完成";
+  if (status === "failed") return "失败";
+  if (status === "submitting") return "提交中";
+  return "生成中";
+}
+
+function cleanClassicLiveMeta(meta = {}) {
+  const cleaned = { ...meta };
+  ["prompt", "modelLabel", "routeLabel", "size", "ratio"].forEach((key) => {
+    if (String(cleaned[key] || "").trim() === "") delete cleaned[key];
+  });
+  ["quantity", "referenceCount"].forEach((key) => {
+    if (!Number.isFinite(Number(cleaned[key])) || Number(cleaned[key]) <= 0) delete cleaned[key];
+  });
+  return cleaned;
+}
+
+function getClassicLiveCurrentPillLabel(pillId) {
+  const pill = document.getElementById(pillId);
+  return String(pill?.querySelector(".trigger-label")?.textContent || "").trim();
+}
+
+function getClassicLiveTaskDetails(task = {}) {
+  const prompt = String(task.prompt || document.getElementById("prompt")?.value || "").trim();
+  const modelLabel = String(task.modelLabel || getClassicLiveCurrentPillLabel("modelPill") || "未记录").trim();
+  const routeLabel = String(task.routeLabel || getClassicLiveCurrentPillLabel("linePill") || "未记录").trim();
+  const ratio = String(task.ratio || getClassicLiveCurrentPillLabel("ratioPill") || "").trim();
+  const size = String(task.size || getClassicLiveCurrentPillLabel("sizePill") || "").trim();
+  const quantity = Number(task.quantity || 0);
+  const quantityText =
+    quantity > 0 ? `${quantity}张` : String(getClassicLiveCurrentPillLabel("qtyPill") || "").trim();
+  const referenceCount = Number(
+    task.referenceCount ||
+      (typeof refImages !== "undefined" && Array.isArray(refImages) ? refImages.length : 0) ||
+      0,
+  );
+  const timeValue = task.completedAt || task.createdAt || Date.now();
+  return {
+    prompt: prompt || "未记录提示词",
+    modelLabel,
+    routeLabel,
+    ratio,
+    size,
+    quantityText,
+    referenceCount,
+    timeText: formatClassicLiveClock(timeValue) || "-",
+  };
+}
+
+function buildClassicLiveInfoHtml(task = {}) {
+  const details = getClassicLiveTaskDetails(task);
+  const paramText = [
+    details.ratio ? `比例 ${details.ratio}` : "",
+    details.size ? `尺寸 ${details.size}` : "",
+    details.quantityText ? `数量 ${details.quantityText}` : "",
+    details.referenceCount > 0 ? `参考图 ${details.referenceCount}` : "参考图 0",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+  return `
+    <div class="classic-live-info-head">
+      <span>图像信息</span>
+      <b>${escapeHtml(details.timeText)}</b>
+    </div>
+    <div class="classic-live-info-body">
+      <div class="classic-live-prompt-row">
+        <span>提示词</span>
+        <p>${escapeHtml(details.prompt)}</p>
+      </div>
+      <div class="classic-live-detail-grid">
+        <div>
+          <span>模型</span>
+          <b>${escapeHtml(details.modelLabel || "未记录")}</b>
+        </div>
+        <div>
+          <span>模式</span>
+          <b>${escapeHtml(details.routeLabel || "未记录")}</b>
+        </div>
+        <div>
+          <span>参数</span>
+          <b>${escapeHtml(paramText || "当前配置")}</b>
+        </div>
+        <div>
+          <span>生成时间</span>
+          <b>${escapeHtml(details.timeText)}</b>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderClassicLiveTasks() {
+  const grid = document.getElementById("classicLiveGrid");
+  if (!grid) return;
+
+  const container = document.getElementById("imgContainer");
+  if (container) container.style.display = "flex";
+
+  const runningCount = classicLiveTasks.filter((task) =>
+    ["submitting", "running"].includes(String(task.status || "")),
+  ).length;
+  const doneCount = classicLiveTasks.filter((task) => task.status === "success").length;
+  const failedCount = classicLiveTasks.filter((task) => task.status === "failed").length;
+  const runningEl = document.getElementById("classicLiveRunning");
+  const doneEl = document.getElementById("classicLiveDone");
+  const failedEl = document.getElementById("classicLiveFailed");
+  if (runningEl) runningEl.textContent = `进行中 ${runningCount}`;
+  if (doneEl) doneEl.textContent = `已完成 ${doneCount}`;
+  if (failedEl) failedEl.textContent = `失败 ${failedCount}`;
+
+  grid.innerHTML = "";
+  if (classicLiveTasks.length === 0) {
+    const empty = document.createElement("div");
+    empty.id = "classicLiveEmpty";
+    empty.className = "classic-live-empty";
+    empty.innerHTML = `
+      <div class="classic-live-empty-icon">✦</div>
+      <div class="classic-live-empty-title">提交后会在这里显示大图</div>
+      <div class="classic-live-empty-sub">任务生成期间，你可以继续修改参数并提交下一组。</div>
+    `;
+    grid.appendChild(empty);
+    return;
+  }
+
+  const isDesktopLive =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(min-width: 769px)").matches &&
+    !CLASSIC_VIP_MODE;
+
+  if (isDesktopLive) {
+    const existingSelected = classicLiveSelectedId
+      ? classicLiveTasks.find(
+          (task) => task.id === classicLiveSelectedId || task.taskId === classicLiveSelectedId,
+        )
+      : null;
+    const primaryTask = existingSelected || classicLiveTasks[0];
+    classicLiveSelectedId = primaryTask.id || primaryTask.taskId || "";
+
+    const buildMediaHtml = (task) => {
+      const status = String(task.status || "running");
+      const fullUrl = getClassicLiveFullUrl(task);
+      const isSuccess = status === "success" && fullUrl;
+      const isFailed = status === "failed";
+      if (isSuccess) {
+        return `<img src="${escapeHtml(fullUrl)}" alt="生成结果" loading="lazy" referrerpolicy="no-referrer">`;
+      }
+      if (isFailed) {
+        return `<div class="classic-live-error">${escapeHtml(task.errorMessage || "生成失败，请重试")}</div>`;
+      }
+      return `
+        <div class="classic-live-pending-visual">
+          <div class="classic-live-spinner"></div>
+          <div>${status === "submitting" ? "正在提交任务..." : "上游正在生成..."}</div>
+          <div class="classic-live-loading-bar"></div>
+        </div>
+      `;
+    };
+
+    const buildActionsHtml = (task, isPrimary = false) => {
+      const fullUrl = getClassicLiveFullUrl(task);
+      const status = String(task.status || "");
+      const canDelete = status === "success" || status === "failed";
+      if (status !== "success" && !canDelete) return "";
+      const actionClass = isPrimary
+        ? "classic-live-actions classic-live-primary-actions"
+        : "classic-live-actions";
+      const mainButtons =
+        status === "success" && fullUrl
+          ? `
+          <button type="button" class="classic-live-action-btn" data-action="zoom" title="放大" aria-label="放大">放大</button>
+          <button type="button" class="classic-live-action-btn" data-action="download" title="保存原图" aria-label="保存原图">下载</button>
+          <button type="button" class="classic-live-action-btn" data-action="regen" title="重生" aria-label="重生">重生</button>
+          <button type="button" class="classic-live-action-btn" data-action="ref" title="设为参考图" aria-label="设为参考图">参考</button>
+          <button type="button" class="classic-live-action-btn" data-action="copy" title="复制原图链接" aria-label="复制原图链接">链接</button>
+        `
+          : "";
+      return `
+        <div class="${actionClass}">
+          ${mainButtons}
+          ${
+            canDelete
+              ? `<button type="button" class="classic-live-action-btn danger" data-action="delete" title="删除" aria-label="删除">删除</button>`
+              : ""
+          }
+        </div>
+      `;
+    };
+
+    const bindLiveActions = (root, task) => {
+      const readFullUrl = () => root.dataset.fullUrl || root.dataset.previewUrl || "";
+      const media = root.querySelector(".classic-live-media");
+      if (media) media.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        const fullUrl = readFullUrl();
+        if (fullUrl) openLightbox(fullUrl);
+      });
+      const zoomBtn = root.querySelector('[data-action="zoom"]');
+      if (zoomBtn) zoomBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openLightbox(readFullUrl());
+      });
+      const downBtn = root.querySelector('[data-action="download"]');
+      if (downBtn) downBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        downloadSingleImg(readFullUrl());
+      });
+      const regenBtn = root.querySelector('[data-action="regen"]');
+      if (regenBtn) regenBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        regenerateFromHistory(encodeURIComponent(task.prompt || ""));
+      });
+      const refBtn = root.querySelector('[data-action="ref"]');
+      if (refBtn) refBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        useAsRef(readFullUrl(), refBtn);
+      });
+      const copyBtn = root.querySelector('[data-action="copy"]');
+      if (copyBtn) copyBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        copyImgUrl(readFullUrl());
+      });
+      const deleteBtn = root.querySelector('[data-action="delete"]');
+      if (deleteBtn) deleteBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        removeClassicLiveTask(task.id || task.taskId || "");
+      });
+    };
+
+    const primaryStatus = String(primaryTask.status || "running");
+    const primaryFullUrl = getClassicLiveFullUrl(primaryTask);
+    const primaryPreviewUrl = getClassicLivePreviewUrl(primaryTask);
+    const primaryTimeValue = primaryTask.completedAt || primaryTask.createdAt;
+
+    const primaryCard = document.createElement("div");
+    primaryCard.className = [
+      "classic-live-card",
+      "is-primary",
+      primaryStatus === "success" && primaryFullUrl ? "is-success" : "",
+      primaryStatus === "failed" ? "is-failed" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    primaryCard.dataset.fullUrl = primaryFullUrl;
+    primaryCard.dataset.previewUrl = primaryPreviewUrl;
+    primaryCard.innerHTML = `
+      <div class="classic-live-media">
+        ${buildMediaHtml(primaryTask)}
+        <div class="classic-live-meta">
+          <span class="classic-live-chip">${escapeHtml(getClassicLiveStatusLabel(primaryStatus))} #${Number(primaryTask.index || 1)}</span>
+          <span class="classic-live-time">${escapeHtml(formatClassicLiveClock(primaryTimeValue))}</span>
+        </div>
+        ${buildActionsHtml(primaryTask, true)}
+      </div>
+    `;
+    const primaryImg = primaryCard.querySelector("img");
+    if (primaryImg && primaryPreviewUrl && primaryPreviewUrl !== primaryFullUrl) {
+      primaryImg.addEventListener("error", () => {
+        if (primaryImg.dataset.fallbackApplied === "1") return;
+        primaryImg.dataset.fallbackApplied = "1";
+        primaryImg.src = primaryPreviewUrl;
+      });
+    }
+    bindLiveActions(primaryCard, primaryTask);
+    grid.appendChild(primaryCard);
+
+    const selectedInfo = document.createElement("div");
+    selectedInfo.className = "classic-live-selected-info";
+    selectedInfo.innerHTML = buildClassicLiveInfoHtml(primaryTask);
+    grid.appendChild(selectedInfo);
+
+    if (classicLiveTasks.length > 1) {
+      const strip = document.createElement("div");
+      strip.className = "classic-live-strip";
+      classicLiveTasks.forEach((task) => {
+        const status = String(task.status || "running");
+        const fullUrl = getClassicLiveFullUrl(task);
+        const previewUrl = getClassicLivePreviewUrl(task);
+        const thumbSrc = previewUrl || fullUrl;
+        const isSelected =
+          task.id === primaryTask.id ||
+          (Boolean(task.taskId) && task.taskId === primaryTask.taskId);
+        const thumb = document.createElement("button");
+        thumb.type = "button";
+        thumb.className = [
+          "classic-live-thumb-card",
+          isSelected ? "active" : "",
+          status === "failed" ? "is-failed" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        thumb.dataset.liveId = task.id || task.taskId || "";
+        thumb.dataset.fullUrl = fullUrl;
+        thumb.innerHTML = `
+          <div class="classic-live-thumb-media">
+            ${
+              thumbSrc
+                ? `<img src="${escapeHtml(thumbSrc)}" alt="生成结果缩略图" loading="lazy" referrerpolicy="no-referrer">`
+                : `<div class="classic-live-thumb-pending">${escapeHtml(getClassicLiveStatusLabel(status))}</div>`
+            }
+          </div>
+          <div class="classic-live-thumb-meta">
+            <span>${escapeHtml(getClassicLiveStatusLabel(status))} #${Number(task.index || 1)}</span>
+            <b>${escapeHtml(formatClassicLiveClock(task.completedAt || task.createdAt))}</b>
+          </div>
+        `;
+        thumb.addEventListener("click", () => {
+          classicLiveSelectedId = thumb.dataset.liveId || "";
+          renderClassicLiveTasks();
+        });
+        strip.appendChild(thumb);
+      });
+      grid.appendChild(strip);
+    }
+    return;
+  }
+
+  classicLiveTasks.forEach((task, index) => {
+    const status = String(task.status || "running");
+    const fullUrl = getClassicLiveFullUrl(task);
+    const previewUrl = getClassicLivePreviewUrl(task);
+    const isSuccess = status === "success" && fullUrl;
+    const isFailed = status === "failed";
+    const card = document.createElement("div");
+    card.className = [
+      "classic-live-card",
+      index === 0 ? "is-primary" : "",
+      isSuccess ? "is-success" : "",
+      isFailed ? "is-failed" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    card.dataset.fullUrl = fullUrl;
+    card.dataset.previewUrl = previewUrl;
+
+    const timeValue = task.completedAt || task.createdAt;
+    const prompt = task.prompt || "未记录提示词";
+    const configText = [task.modelLabel, task.routeLabel, task.size, task.ratio]
+      .filter(Boolean)
+      .join(" / ");
+    const refText = task.referenceCount > 0 ? ` · 参考图 ${task.referenceCount}` : "";
+
+    let mediaHtml = "";
+    if (isSuccess) {
+      mediaHtml = `<img src="${escapeHtml(fullUrl)}" alt="生成结果" loading="lazy" referrerpolicy="no-referrer">`;
+    } else if (isFailed) {
+      mediaHtml = `<div class="classic-live-error">${escapeHtml(task.errorMessage || "生成失败，请重试")}</div>`;
+    } else {
+      mediaHtml = `
+        <div class="classic-live-pending-visual">
+          <div class="classic-live-spinner"></div>
+          <div>${status === "submitting" ? "正在提交任务..." : "上游正在生成..."}</div>
+          <div class="classic-live-loading-bar"></div>
+        </div>
+      `;
+    }
+
+    const actionsHtml = isSuccess
+      ? `
+        <div class="classic-live-actions">
+          <button type="button" class="classic-live-action-btn" data-action="zoom" title="放大">🔍</button>
+          <button type="button" class="classic-live-action-btn" data-action="download" title="保存原图">💾</button>
+          <button type="button" class="classic-live-action-btn" data-action="ref" title="设为参考图">🧩</button>
+          <button type="button" class="classic-live-action-btn" data-action="copy" title="复制原图链接">🔗</button>
+          <button type="button" class="classic-live-action-btn danger" data-action="delete" title="删除">🗑️</button>
+        </div>
+      `
+      : isFailed
+        ? `
+        <div class="classic-live-actions">
+          <button type="button" class="classic-live-action-btn danger" data-action="delete" title="删除">🗑️</button>
+        </div>
+      `
+        : "";
+
+    card.innerHTML = `
+      <div class="classic-live-media">
+        ${mediaHtml}
+        <div class="classic-live-meta">
+          <span class="classic-live-chip">${escapeHtml(getClassicLiveStatusLabel(status))} #${Number(task.index || 1)}</span>
+          <span class="classic-live-time">${escapeHtml(formatClassicLiveClock(timeValue))}</span>
+        </div>
+      </div>
+      <div class="classic-live-info">
+        <div>
+          <div class="classic-live-prompt">${escapeHtml(prompt)}</div>
+          <div class="classic-live-config">${escapeHtml(configText || "当前配置")}${escapeHtml(refText)}</div>
+        </div>
+        ${actionsHtml}
+      </div>
+    `;
+
+    const img = card.querySelector("img");
+    if (img && previewUrl && previewUrl !== fullUrl) {
+      img.addEventListener("error", () => {
+        if (img.dataset.fallbackApplied === "1") return;
+        img.dataset.fallbackApplied = "1";
+        img.src = previewUrl;
+      });
+    }
+
+    const readFullUrl = () => card.dataset.fullUrl || card.dataset.previewUrl || "";
+    const media = card.querySelector(".classic-live-media");
+    if (media) {
+      media.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        const full = readFullUrl();
+        if (full) openLightbox(full);
+      });
+    }
+    const zoomBtn = card.querySelector('[data-action="zoom"]');
+    if (zoomBtn) zoomBtn.addEventListener("click", () => openLightbox(readFullUrl()));
+    const downBtn = card.querySelector('[data-action="download"]');
+    if (downBtn) downBtn.addEventListener("click", () => downloadSingleImg(readFullUrl()));
+    const refBtn = card.querySelector('[data-action="ref"]');
+    if (refBtn) refBtn.addEventListener("click", () => useAsRef(readFullUrl(), refBtn));
+    const copyBtn = card.querySelector('[data-action="copy"]');
+    if (copyBtn) copyBtn.addEventListener("click", () => copyImgUrl(readFullUrl()));
+    const deleteBtn = card.querySelector('[data-action="delete"]');
+    if (deleteBtn) deleteBtn.addEventListener("click", () => removeClassicLiveTask(task.id || task.taskId || ""));
+
+    grid.appendChild(card);
+  });
+}
+
+function createClassicLiveTask(snapshot = {}) {
+  const task = normalizeClassicLiveTask({
+    ...snapshot,
+    id: snapshot.id || makeClassicLiveId(),
+    tempId: snapshot.tempId || "",
+    status: snapshot.status || "submitting",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  classicLiveTasks = [task, ...classicLiveTasks.filter((item) => item.id !== task.id)];
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return task.id;
+}
+
+function ensureClassicLiveTaskForPending(snapshot = {}) {
+  const taskId = String(snapshot.taskId || snapshot.id || "").trim();
+  if (!taskId) return "";
+  const existingIndex = findClassicLiveTaskIndex(taskId);
+  const nextTask = normalizeClassicLiveTask({
+    ...snapshot,
+    id: existingIndex >= 0 ? classicLiveTasks[existingIndex].id : taskId,
+    taskId,
+    status: snapshot.status || "running",
+    updatedAt: Date.now(),
+  });
+  if (existingIndex >= 0) {
+    classicLiveTasks[existingIndex] = {
+      ...classicLiveTasks[existingIndex],
+      ...nextTask,
+      originalUrl: classicLiveTasks[existingIndex].originalUrl || nextTask.originalUrl,
+      previewUrl: classicLiveTasks[existingIndex].previewUrl || nextTask.previewUrl,
+    };
+  } else {
+    classicLiveTasks.unshift(nextTask);
+  }
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return nextTask.id;
+}
+
+function updateClassicLiveTask(idOrTaskId, updates = {}) {
+  const idx = findClassicLiveTaskIndex(idOrTaskId);
+  if (idx < 0) return "";
+  classicLiveTasks[idx] = normalizeClassicLiveTask({
+    ...classicLiveTasks[idx],
+    ...updates,
+    updatedAt: Date.now(),
+  });
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return classicLiveTasks[idx].id;
+}
+
+function removeClassicLiveTask(idOrTaskId) {
+  const normalizedId = String(idOrTaskId || "").trim();
+  if (!normalizedId) return false;
+
+  const removedTask = classicLiveTasks.find(
+    (task) => task.id === normalizedId || task.taskId === normalizedId,
+  );
+  const nextTasks = classicLiveTasks.filter(
+    (task) => task.id !== normalizedId && task.taskId !== normalizedId,
+  );
+  if (nextTasks.length === classicLiveTasks.length) return false;
+
+  classicLiveTasks = nextTasks;
+  if (
+    classicLiveSelectedId === normalizedId ||
+    (removedTask &&
+      (classicLiveSelectedId === removedTask.id ||
+        classicLiveSelectedId === removedTask.taskId))
+  ) {
+    classicLiveSelectedId = "";
+  }
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return true;
+}
+
+function promoteClassicLiveTask(tempId, taskId, updates = {}) {
+  const id = String(tempId || taskId || "").trim();
+  const taskKey = String(taskId || "").trim();
+  if (!id && !taskKey) return "";
+  const idx = findClassicLiveTaskIndex(id || taskKey);
+  if (idx < 0) {
+    return ensureClassicLiveTaskForPending({ ...updates, taskId: taskKey, status: "running" });
+  }
+  classicLiveTasks[idx] = normalizeClassicLiveTask({
+    ...classicLiveTasks[idx],
+    ...updates,
+    taskId: taskKey || classicLiveTasks[idx].taskId,
+    status: updates.status || "running",
+    updatedAt: Date.now(),
+  });
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return classicLiveTasks[idx].id;
+}
+
+function completeClassicLiveTask(idOrTaskId, url, meta = {}) {
+  const fullUrl = String(url || meta.originalUrl || meta.fullUrl || "").trim();
+  const id = String(idOrTaskId || meta.taskId || "").trim();
+  const cleanedMeta = cleanClassicLiveMeta(meta);
+  let idx = findClassicLiveTaskIndex(id);
+  if (idx < 0) {
+    const createdId = createClassicLiveTask({
+      ...cleanedMeta,
+      id: id || makeClassicLiveId(),
+      taskId: meta.taskId || id,
+      status: "running",
+    });
+    idx = findClassicLiveTaskIndex(createdId);
+  }
+  if (idx < 0) return "";
+  const previous = classicLiveTasks[idx];
+  classicLiveTasks[idx] = normalizeClassicLiveTask({
+    ...previous,
+    ...cleanedMeta,
+    status: "success",
+    originalUrl: fullUrl || previous.originalUrl,
+    previewUrl: String(meta.previewUrl || previous.previewUrl || getClassicLine4ThumbUrl(fullUrl) || ""),
+    errorMessage: "",
+    completedAt: Number(meta.completedAt || Date.now()),
+    updatedAt: Date.now(),
+  });
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return classicLiveTasks[idx].id;
+}
+
+function failClassicLiveTask(idOrTaskId, message, meta = {}) {
+  const id = String(idOrTaskId || meta.taskId || "").trim();
+  const cleanedMeta = cleanClassicLiveMeta(meta);
+  let idx = findClassicLiveTaskIndex(id);
+  if (idx < 0) {
+    const createdId = createClassicLiveTask({
+      ...cleanedMeta,
+      id: id || makeClassicLiveId(),
+      taskId: meta.taskId || id,
+      status: "running",
+    });
+    idx = findClassicLiveTaskIndex(createdId);
+  }
+  if (idx < 0) return "";
+  classicLiveTasks[idx] = normalizeClassicLiveTask({
+    ...classicLiveTasks[idx],
+    ...cleanedMeta,
+    status: "failed",
+    errorMessage: String(message || "生成失败，请重试"),
+    completedAt: Number(meta.completedAt || Date.now()),
+    updatedAt: Date.now(),
+  });
+  persistClassicLiveTasks();
+  renderClassicLiveTasks();
+  return classicLiveTasks[idx].id;
+}
+
+window.createClassicLiveTask = createClassicLiveTask;
+window.ensureClassicLiveTaskForPending = ensureClassicLiveTaskForPending;
+window.updateClassicLiveTask = updateClassicLiveTask;
+window.promoteClassicLiveTask = promoteClassicLiveTask;
+window.completeClassicLiveTask = completeClassicLiveTask;
+window.failClassicLiveTask = failClassicLiveTask;
+window.removeClassicLiveTask = removeClassicLiveTask;
+window.renderClassicLiveTasks = renderClassicLiveTasks;
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => {
+    readClassicLiveTasks();
+    renderClassicLiveTasks();
+  });
+} else {
+  readClassicLiveTasks();
+  renderClassicLiveTasks();
+}
+
+window.addEventListener("resize", () => {
+  if (classicLiveResizeTimer) clearTimeout(classicLiveResizeTimer);
+  classicLiveResizeTimer = window.setTimeout(() => {
+    renderClassicLiveTasks();
+  }, 160);
+});
+
 function clearHistoryObjectUrlRefs() {
   historyObjectUrls.forEach((url) => URL.revokeObjectURL(url));
   historyObjectUrls = [];
@@ -138,6 +941,143 @@ function parseAspectRatio(ratioText) {
   if (!w || !h) return { w: 1, h: 1, text: "1:1" };
   return { w, h, text: `${w}:${h}` };
 }
+
+function isClassicGptImageModel(modelId = imageModel) {
+  return String(modelId || "").trim() === "gpt-image-2";
+}
+
+function getCurrentRefImageLimit(modelId = imageModel) {
+  return isClassicGptImageModel(modelId) ? GPT_MAX_REF_IMAGES : DEFAULT_MAX_REF_IMAGES;
+}
+
+function readClassicGptOutputCompression() {
+  try {
+    const rawValue = String(localStorage.getItem(GPT_IMAGE_OUTPUT_COMPRESSION_KEY) || "").trim();
+    if (!rawValue) return null;
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(0, Math.min(100, Math.round(parsed)));
+  } catch (_) {
+    return null;
+  }
+}
+
+function getClassicGptSettings() {
+  try {
+    const quality = String(localStorage.getItem(GPT_IMAGE_QUALITY_KEY) || GPT_IMAGE_DEFAULTS.quality).trim().toLowerCase();
+    const outputFormat = String(localStorage.getItem(GPT_IMAGE_OUTPUT_FORMAT_KEY) || GPT_IMAGE_DEFAULTS.outputFormat).trim().toLowerCase();
+    const moderation = String(localStorage.getItem(GPT_IMAGE_MODERATION_KEY) || GPT_IMAGE_DEFAULTS.moderation).trim().toLowerCase();
+    return {
+      quality: ["auto", "low", "medium", "high"].includes(quality) ? quality : GPT_IMAGE_DEFAULTS.quality,
+      outputFormat: ["png", "jpeg", "webp"].includes(outputFormat) ? outputFormat : GPT_IMAGE_DEFAULTS.outputFormat,
+      outputCompression: readClassicGptOutputCompression(),
+      moderation: ["auto", "low"].includes(moderation) ? moderation : GPT_IMAGE_DEFAULTS.moderation,
+    };
+  } catch (_) {
+    return { ...GPT_IMAGE_DEFAULTS };
+  }
+}
+
+function setClassicGptCompression(value) {
+  const input = document.getElementById("gptOutputCompressionInput");
+  const format = document.getElementById("gptOutputFormatPill")?.getAttribute("data-selected-value") || "png";
+  if (String(format).toLowerCase() === "png") {
+    localStorage.removeItem(GPT_IMAGE_OUTPUT_COMPRESSION_KEY);
+    if (input) input.value = "";
+    return;
+  }
+
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    localStorage.removeItem(GPT_IMAGE_OUTPUT_COMPRESSION_KEY);
+    if (input) input.value = "";
+    return;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return;
+  const normalized = Math.max(0, Math.min(100, Math.round(parsed)));
+  localStorage.setItem(GPT_IMAGE_OUTPUT_COMPRESSION_KEY, String(normalized));
+  if (input) input.value = String(normalized);
+}
+
+function updateClassicGptCompressionState() {
+  const input = document.getElementById("gptOutputCompressionInput");
+  const format = String(
+    document.getElementById("gptOutputFormatPill")?.getAttribute("data-selected-value") || GPT_IMAGE_DEFAULTS.outputFormat,
+  ).toLowerCase();
+  if (!input) return;
+
+  const disabled = format === "png";
+  input.disabled = disabled;
+  if (disabled) {
+    input.value = "";
+  } else {
+    const compression = getClassicGptSettings().outputCompression;
+    input.value = compression === null ? "" : String(compression);
+  }
+}
+
+function updateClassicRefUploadHint() {
+  const limit = getCurrentRefImageLimit();
+  const hint = document.getElementById("uploadHintText");
+  if (hint) {
+    hint.textContent = `点击或拖拽图片到此处（最多${limit}张）`;
+  }
+  updateRefCountBadge();
+}
+
+function enforceCurrentRefImageLimit() {
+  const limit = getCurrentRefImageLimit();
+  if (!Array.isArray(refImages) || refImages.length <= limit) {
+    updateClassicRefUploadHint();
+    return false;
+  }
+  refImages = refImages.slice(0, limit);
+  renderThumbs();
+  showSoftToast(`当前模型最多支持 ${limit} 张参考图，已保留前 ${limit} 张`);
+  return true;
+}
+
+function updateClassicGptSettingsUi() {
+  const row = document.getElementById("gptImageSettingsRow");
+  const isVisible = isClassicGptImageModel();
+  if (row) {
+    row.style.display = isVisible ? "grid" : "none";
+  }
+
+  const settings = getClassicGptSettings();
+  const qualityPill = document.getElementById("gptQualityPill");
+  const formatPill = document.getElementById("gptOutputFormatPill");
+  const moderationPill = document.getElementById("gptModerationPill");
+  const compressionInput = document.getElementById("gptOutputCompressionInput");
+
+  const syncPill = (pill, value) => {
+    if (!pill) return;
+    const target = pill.querySelector(`.dropdown-item[data-value="${value}"]`);
+    if (!target) return;
+    pill.querySelectorAll(".dropdown-item").forEach((item) => item.classList.remove("active"));
+    target.classList.add("active");
+    pill.setAttribute("data-selected-value", value);
+    const triggerLabel = pill.querySelector(".trigger-label");
+    if (triggerLabel) {
+      triggerLabel.innerText = target.querySelector("span")?.innerText || target.innerText;
+    }
+  };
+
+  syncPill(qualityPill, settings.quality);
+  syncPill(formatPill, settings.outputFormat);
+  syncPill(moderationPill, settings.moderation);
+  if (compressionInput) {
+    compressionInput.value = settings.outputCompression === null ? "" : String(settings.outputCompression);
+  }
+  updateClassicGptCompressionState();
+}
+
+window.getClassicGptSettings = getClassicGptSettings;
+window.setClassicGptCompression = setClassicGptCompression;
+window.updateClassicGptSettingsUi = updateClassicGptSettingsUi;
+window.updateClassicRefUploadHint = updateClassicRefUploadHint;
 
 function buildGrokSizeInstruction(size, ratioValue, smartRatioValue) {
   const qualityBase = { "1K": 1024, "2K": 2048, "4K": 3840 }[size] || 1024;
@@ -185,7 +1125,7 @@ function setHistoryCacheBadge(cardEl, status) {
     badge.textContent = "已本地保存";
   } else if (status === "cloud") {
     badge.classList.add("cloud");
-    badge.textContent = "云端链接";
+    badge.textContent = "本地资产";
   } else {
     badge.classList.add("syncing");
     badge.textContent = "缓存中";
@@ -245,7 +1185,7 @@ function updateRefCountBadge() {
   const badge = document.getElementById("refCountBadge");
   if (!badge) return;
   const current = Array.isArray(refImages) ? refImages.length : 0;
-  badge.textContent = `${current}/${MAX_REF_IMAGES}`;
+  badge.textContent = `${current}/${getCurrentRefImageLimit()}`;
 }
 
 function updateRefMentionSummary(state) {
@@ -545,15 +1485,23 @@ window.selectPill = function(pillId, element, costLabel = null) {
   if (pillId === 'modelPill') {
     imageModel = val;
     localStorage.setItem('nb_image_model', val);
+    selectClassicLineSilently(getLowestClassicRouteForModel(val));
     updateModelUI();
   } else if (pillId === 'linePill') {
-    localStorage.setItem('nb_line', val);
+    localStorage.setItem('nb_line', normalizeClassicLine(val));
   } else if (pillId === 'grokRefModePill') {
     const mode = val === "classic_multi" ? "classic_multi" : "stable_fusion";
     localStorage.setItem(GROK_REF_MODE_KEY, mode);
+  } else if (pillId === 'gptQualityPill') {
+    localStorage.setItem(GPT_IMAGE_QUALITY_KEY, val);
+  } else if (pillId === 'gptOutputFormatPill') {
+    localStorage.setItem(GPT_IMAGE_OUTPUT_FORMAT_KEY, val);
+    updateClassicGptCompressionState();
+  } else if (pillId === 'gptModerationPill') {
+    localStorage.setItem(GPT_IMAGE_MODERATION_KEY, val);
   }
 
-  if (pillId === 'modelPill' || pillId === 'linePill' || pillId === 'sizePill') {
+  if (pillId === 'modelPill' || pillId === 'linePill' || pillId === 'sizePill' || pillId === 'qtyPill') {
     if (typeof window.refreshClassicCatalogUi === 'function') {
       window.refreshClassicCatalogUi();
     }
@@ -581,6 +1529,19 @@ document.addEventListener('click', () => {
 function updateDropdownOpenState() {
   const hasOpenDropdown = !!document.querySelector('.dropdown-menu.show');
   document.body.classList.toggle('dropdown-open-active', hasOpenDropdown);
+  document.querySelectorAll('.params-row.dropdown-open-row').forEach((row) =>
+    row.classList.remove('dropdown-open-row'),
+  );
+  document.querySelectorAll('.right-column.dropdown-open-column').forEach((column) =>
+    column.classList.remove('dropdown-open-column'),
+  );
+
+  if (!hasOpenDropdown) return;
+  const openMenu = document.querySelector('.dropdown-menu.show');
+  const openRow = openMenu ? openMenu.closest('.params-row') : null;
+  if (openRow) openRow.classList.add('dropdown-open-row');
+  const openColumn = openMenu ? openMenu.closest('.right-column') : null;
+  if (openColumn) openColumn.classList.add('dropdown-open-column');
 }
 
 function updateModelUI() {
@@ -611,7 +1572,7 @@ function updateModelUI() {
   const lineModule = document.getElementById('lineModule');
   const grokRefModeModule = document.getElementById('grokRefModeModule');
 
-  // 根据模型切换线路选择器显示逻辑，其他保持静态
+  // 根据模型切换模式选择器显示逻辑，其他保持静态
   if (lineModule) {
     lineModule.style.display = (imageModel === 'nano-banana') ? 'flex' : 'none';
   }
@@ -632,7 +1593,453 @@ function updateModelUI() {
       if (defaultItem) selectPill('ratioPill', defaultItem);
     }
   }
+
+  updateClassicRefUploadHint();
+  updateClassicGptSettingsUi();
+  enforceCurrentRefImageLimit();
+  updateCurrentPriceCard();
 }
+
+function formatClassicPoint(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(1) : "0.0";
+}
+
+function normalizeClassicSize(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized || "1k";
+}
+
+function formatClassicSizeLabel(value) {
+  const normalized = normalizeClassicSize(value);
+  return normalized === "auto" ? "自动" : normalized.toUpperCase();
+}
+
+function normalizeClassicLine(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (/^\d+$/.test(raw)) return `line${raw}`;
+  return raw || "default";
+}
+
+function getClassicLineDomValue(line) {
+  const normalized = normalizeClassicLine(line);
+  const match = normalized.match(/^line([0-9]+)$/);
+  return match?.[1] || normalized;
+}
+
+function getClassicLineLabel(line, fallback = "") {
+  const normalized = normalizeClassicLine(line);
+  const match = normalized.match(/^line([0-9]+)$/);
+  const enterpriseLabels = {
+    line1: "标准模式",
+    line2: "高清模式",
+    line3: "稳定模式",
+    line4: "本地存储模式",
+    default: "默认模式",
+  };
+  if (enterpriseLabels[normalized]) return enterpriseLabels[normalized];
+  if (match?.[1]) return `模式 ${match[1]}`;
+  if (normalized === "default") return "默认模式";
+  return String(fallback || line || "模式").trim();
+}
+
+function getClassicModelAlias(modelId = imageModel) {
+  const value = String(modelId || "").trim();
+  if (value === "nano-banana-2") return "gemini-flash";
+  return value;
+}
+
+function getClassicModels() {
+  return Array.isArray(classicPricingCatalog?.models)
+    ? classicPricingCatalog.models.filter((model) => model?.isActive !== false)
+    : [];
+}
+
+function getClassicRoutes() {
+  return Array.isArray(classicPricingCatalog?.routes)
+    ? classicPricingCatalog.routes.filter((route) => route?.isActive !== false)
+    : [];
+}
+
+function getClassicModelConfig(modelId = imageModel) {
+  const alias = getClassicModelAlias(modelId);
+  return (
+    getClassicModels().find((model) => model.id === alias) ||
+    getClassicModels().find((model) => model.id === modelId) ||
+    getClassicModels()[0] ||
+    null
+  );
+}
+
+function getClassicRoutesForModel(model) {
+  if (!model) return [];
+  const family = String(model.routeFamily || model.modelFamily || model.id || "").trim();
+  return getClassicRoutes().filter((route) => String(route.modelFamily || "").trim() === family);
+}
+
+function getClassicSelectedRoute(model = getClassicModelConfig()) {
+  const routes = getClassicRoutesForModel(model);
+  if (!routes.length) return null;
+  const selectedLine = imageModel === "nano-banana"
+    ? normalizeClassicLine(
+      localStorage.getItem("nb_line") ||
+      document.getElementById("linePill")?.getAttribute("data-selected-value") ||
+      "1",
+    )
+    : "default";
+  return (
+    routes.find((route) => normalizeClassicLine(route.line) === selectedLine) ||
+    routes.find((route) => route.isDefaultRoute) ||
+    routes[0]
+  );
+}
+
+function getLowestClassicRouteForModel(modelId = imageModel, size = null) {
+  const model = getClassicModelConfig(modelId);
+  if (!model) return null;
+  const currentSize = size || getClassicCurrentSize(model);
+  const routes = getClassicRoutesForModel(model);
+  if (!routes.length) return null;
+  return [...routes].sort((left, right) => {
+    const leftCost = getClassicRouteCost(left, currentSize, model.selectorCost || 0);
+    const rightCost = getClassicRouteCost(right, currentSize, model.selectorCost || 0);
+    if (leftCost !== rightCost) return leftCost - rightCost;
+
+    const leftDefault = left.isDefaultRoute || left.isDefaultNanoBananaLine ? 1 : 0;
+    const rightDefault = right.isDefaultRoute || right.isDefaultNanoBananaLine ? 1 : 0;
+    if (leftDefault !== rightDefault) return rightDefault - leftDefault;
+
+    if ((left.sortOrder || 0) !== (right.sortOrder || 0)) {
+      return (left.sortOrder || 0) - (right.sortOrder || 0);
+    }
+
+    return String(left.label || "").localeCompare(String(right.label || ""));
+  })[0];
+}
+
+function selectClassicLineSilently(route) {
+  const linePill = document.getElementById("linePill");
+  if (!linePill || !route) return;
+  const storedLineValue = normalizeClassicLine(route.line);
+  const candidateValues = Array.from(new Set([
+    String(route.line || "").trim(),
+    storedLineValue,
+    getClassicLineDomValue(route.line),
+  ].filter(Boolean)));
+  let lineItem = candidateValues
+    .map((value) => linePill.querySelector(`.dropdown-item[data-value="${value}"]`))
+    .find(Boolean);
+  if (!lineItem) {
+    lineItem = document.createElement("div");
+    lineItem.className = "dropdown-item";
+    lineItem.dataset.value = storedLineValue;
+    lineItem.textContent = getClassicLineLabel(route.line, route.label);
+    lineItem.onclick = function () { selectPill("linePill", this); };
+    linePill.querySelector(".dropdown-menu")?.appendChild(lineItem);
+  }
+
+  linePill.querySelectorAll(".dropdown-item").forEach((item) => item.classList.remove("active"));
+  lineItem.classList.add("active");
+  linePill.setAttribute("data-selected-value", lineItem.getAttribute("data-value") || storedLineValue);
+  const triggerLabel = linePill.querySelector(".trigger-label");
+  if (triggerLabel) triggerLabel.innerText = getClassicLineLabel(route.line, route.label);
+  localStorage.setItem("nb_line", storedLineValue);
+}
+
+function getClassicSizeOptions(model) {
+  const raw = Array.isArray(model?.sizeOptions) && model.sizeOptions.length
+    ? model.sizeOptions
+    : [model?.defaultSize || "1k"];
+  return Array.from(new Set(raw.map((size) => normalizeClassicSize(size)).filter(Boolean)));
+}
+
+function getClassicCurrentSize(model = getClassicModelConfig()) {
+  const selected = normalizeClassicSize(document.getElementById("sizePill")?.getAttribute("data-selected-value") || "1K");
+  const options = getClassicSizeOptions(model);
+  return options.includes(selected) ? selected : normalizeClassicSize(model?.defaultSize || options[0] || selected);
+}
+
+function getClassicRouteCost(route, size, fallback = 0) {
+  const key = normalizeClassicSize(size);
+  const override = route?.sizeOverrides?.[key];
+  const value = override && Number.isFinite(Number(override.pointCost))
+    ? Number(override.pointCost)
+    : Number(route?.pointCost ?? fallback);
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function getClassicQuantity() {
+  const value = Number.parseInt(
+    document.getElementById("qtyPill")?.getAttribute("data-selected-value") || "1",
+    10,
+  );
+  return [1, 2, 4, 8, 16].includes(value) ? value : 1;
+}
+
+function getClassicCurrentPricing() {
+  const model = getClassicModelConfig();
+  const route = getClassicSelectedRoute(model);
+  const size = getClassicCurrentSize(model);
+  const quantity = getClassicQuantity();
+  const unitCost = getClassicRouteCost(route, size, model?.selectorCost || 0);
+  return {
+    model,
+    route,
+    size,
+    quantity,
+    unitCost,
+    totalCost: unitCost * quantity,
+  };
+}
+
+function updateCurrentPriceCard() {
+  const meta = document.getElementById("currentPriceMeta");
+  const total = document.getElementById("currentPriceTotal");
+  if (!meta || !total) return;
+  const pricing = getClassicCurrentPricing();
+  const modelLabel = pricing.model?.label || "当前模型";
+  const routeLabel = getClassicLineLabel(pricing.route?.line || "", pricing.route?.label || "");
+  meta.textContent = `${modelLabel} / ${routeLabel} / ${formatClassicSizeLabel(pricing.size)} / ${pricing.quantity} 张`;
+  total.textContent = `${formatClassicPoint(pricing.totalCost)} 🪙`;
+
+  const modalMeta = document.getElementById("priceCurrentMeta");
+  const modalTotal = document.getElementById("priceCurrentTotal");
+  if (modalMeta) {
+    modalMeta.textContent = `${modelLabel} / ${routeLabel} / ${formatClassicSizeLabel(pricing.size)} / 单张 ${formatClassicPoint(pricing.unitCost)}`;
+  }
+  if (modalTotal) {
+    modalTotal.textContent = `${formatClassicPoint(pricing.totalCost)} 🪙`;
+  }
+}
+
+async function loadClassicPricingCatalog() {
+  try {
+    const [modelRes, routeRes] = await Promise.all([
+      fetch("/api/image-models/catalog"),
+      fetch("/api/image-routes/catalog"),
+    ]);
+    if (!modelRes.ok || !routeRes.ok) return;
+    const modelCatalog = await modelRes.json();
+    const routeCatalog = await routeRes.json();
+    const models = Array.isArray(modelCatalog?.models) ? modelCatalog.models : [];
+    const routes = Array.isArray(routeCatalog?.routes) ? routeCatalog.routes : [];
+    if (!models.length || !routes.length) return;
+    classicPricingCatalog = { models, routes };
+    renderPriceLineFilter();
+    const model = getClassicModelConfig(imageModel);
+    const storedLine = normalizeClassicLine(localStorage.getItem("nb_line") || "");
+    const storedRoute = storedLine
+      ? getClassicRoutesForModel(model).find((route) => normalizeClassicLine(route.line) === storedLine)
+      : null;
+    selectClassicLineSilently(storedRoute || getLowestClassicRouteForModel(imageModel));
+    updateCurrentPriceCard();
+  } catch (error) {
+    console.warn("加载点数消耗说明失败，使用本地消耗配置兜底", error);
+  }
+}
+
+function renderPriceLineFilter() {
+  const select = document.getElementById("priceLineFilter");
+  if (!select) return;
+  const previous = select.value || PRICE_LINE_ALL;
+  const lines = new Map();
+  getClassicRoutes().forEach((route) => {
+    lines.set(normalizeClassicLine(route.line), getClassicLineLabel(route.line, route.label));
+  });
+  select.innerHTML = `<option value="${PRICE_LINE_ALL}">全部模式</option>`;
+  lines.forEach((label, value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  });
+  select.value = Array.from(lines.keys()).includes(previous) ? previous : PRICE_LINE_ALL;
+}
+
+function renderPriceTable() {
+  const list = document.getElementById("priceTableList");
+  if (!list) return;
+  const current = getClassicCurrentPricing();
+  const lineFilter = document.getElementById("priceLineFilter")?.value || PRICE_LINE_ALL;
+  const rows = [];
+
+  getClassicModels().forEach((model) => {
+    getClassicRoutesForModel(model)
+      .filter((route) => lineFilter === PRICE_LINE_ALL || normalizeClassicLine(route.line) === lineFilter)
+      .forEach((route) => {
+        rows.push({ model, route, sizes: getClassicSizeOptions(model) });
+      });
+  });
+
+  if (!rows.length) {
+    list.innerHTML = `<div class="notice-empty">暂无价格数据</div>`;
+    renderLowestPriceList();
+    updateCurrentPriceCard();
+    return;
+  }
+
+  list.innerHTML = rows.map(({ model, route, sizes }) => {
+    const isCurrent = current.model?.id === model.id && current.route?.id === route.id;
+    const cells = sizes.map((size) => {
+      const isCurrentSize = isCurrent && normalizeClassicSize(size) === current.size;
+      return `
+        <div class="price-size-cell ${isCurrentSize ? "is-current" : ""}">
+          <div class="price-size-label">${formatClassicSizeLabel(size)}</div>
+          <div class="price-size-cost">${formatClassicPoint(getClassicRouteCost(route, size, model.selectorCost || 0))} 🪙</div>
+        </div>
+      `;
+    }).join("");
+
+    return `
+      <div class="price-row-card ${isCurrent ? "is-current" : ""}">
+        <div class="price-row-head">
+          <div>
+            <div class="price-row-name">${escapeHtml(model.label || model.id || "模型")}</div>
+            <div class="price-row-route">${escapeHtml(getClassicLineLabel(route.line, route.label))}</div>
+          </div>
+          ${isCurrent ? '<div class="price-current-badge">当前使用</div>' : ""}
+        </div>
+        <div class="price-size-grid">${cells}</div>
+      </div>
+    `;
+  }).join("");
+
+  renderLowestPriceList();
+  updateCurrentPriceCard();
+}
+
+function getClassicLowestPrices() {
+  return getClassicModels()
+    .map((model) => {
+      const candidates = getClassicRoutesForModel(model).flatMap((route) =>
+        getClassicSizeOptions(model).map((size) => ({
+          model,
+          route,
+          size,
+          cost: getClassicRouteCost(route, size, model.selectorCost || 0),
+        })),
+      );
+      return candidates.sort((left, right) => left.cost - right.cost)[0] || null;
+    })
+    .filter(Boolean);
+}
+
+function renderLowestPriceList() {
+  const root = document.getElementById("priceLowestList");
+  if (!root) return;
+  const items = getClassicLowestPrices();
+  if (!items.length) {
+    root.innerHTML = `<div class="notice-empty">暂无可用价格</div>`;
+    return;
+  }
+  root.innerHTML = items.map((item) => `
+    <div class="price-lowest-card">
+      <div class="price-lowest-model">${escapeHtml(item.model?.label || item.model?.id || "模型")}</div>
+      <div class="price-lowest-cost">${formatClassicPoint(item.cost)} 🪙</div>
+      <div class="price-lowest-meta">${escapeHtml(getClassicLineLabel(item.route?.line, item.route?.label))} / ${formatClassicSizeLabel(item.size)}</div>
+    </div>
+  `).join("");
+}
+
+window.refreshClassicCatalogUi = function () {
+  updateCurrentPriceCard();
+  renderPriceTable();
+};
+window.updateCurrentPriceCard = updateCurrentPriceCard;
+window.renderPriceTable = renderPriceTable;
+
+window.openPriceCenter = function () {
+  const overlay = document.getElementById("priceOverlay");
+  if (!overlay) return;
+  renderPriceLineFilter();
+  renderPriceTable();
+  overlay.style.display = "flex";
+};
+
+window.closePriceCenter = function () {
+  const overlay = document.getElementById("priceOverlay");
+  if (overlay) overlay.style.display = "none";
+};
+
+window.togglePriceCenter = function (event) {
+  if (event) event.stopPropagation();
+  const overlay = document.getElementById("priceOverlay");
+  if (!overlay || overlay.style.display === "flex") {
+    closePriceCenter();
+  } else {
+    openPriceCenter();
+  }
+};
+
+window.handlePriceOverlayClick = function (event) {
+  if (event.target?.id === "priceOverlay") {
+    closePriceCenter();
+  }
+};
+
+function getClassicAuthSessionToken() {
+  try {
+    return String(localStorage.getItem(AUTH_SESSION_STORAGE_KEY) || "").trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+function getClassicApiKey() {
+  const input = document.getElementById("apiKey");
+  const keyRaw = String(input?.value || localStorage.getItem("nb_key") || "");
+  const key = keyRaw.replace(/[^\x00-\x7F]/g, "").trim();
+  if (input && keyRaw !== key) input.value = key;
+  return key;
+}
+
+function buildClassicRequestHeaders(key = "") {
+  const headers = { "Content-Type": "application/json" };
+  const normalizedKey = String(key || "").trim();
+  const token = getClassicAuthSessionToken();
+  if (normalizedKey) headers.Authorization = `Bearer ${normalizedKey}`;
+  if (token) headers["X-Auth-Session"] = token;
+  return headers;
+}
+
+function setClassicTopAccountText(text, icon = "👤") {
+  const label = document.getElementById("classicTopAccountText");
+  const iconEl = document.querySelector("#classicTopAccountBtn .classic-top-account-icon");
+  if (label) label.textContent = text;
+  if (iconEl) iconEl.textContent = icon;
+}
+
+async function refreshClassicTopAccount() {
+  const token = getClassicAuthSessionToken();
+  if (!token) {
+    setClassicTopAccountText("登录 / 账户", "👤");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/account/me?ledgerPage=1&ledgerPageSize=1", {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Auth-Session": token,
+      },
+    });
+    if (!res.ok) throw new Error(`account status ${res.status}`);
+    const data = await res.json();
+    const points = Number(data?.account?.points || 0);
+    setClassicTopAccountText(`${formatClassicPoint(points)} 点`, "💰");
+  } catch (_) {
+    setClassicTopAccountText("登录 / 账户", "👤");
+  }
+}
+
+window.openClassicAccountPanel = function () {
+  if (typeof switchTab === "function") {
+    switchTab("profile");
+  } else {
+    window.location.href = "/billing";
+  }
+};
 
 function getGrokRefMode() {
   const mode = localStorage.getItem(GROK_REF_MODE_KEY) || "stable_fusion";
@@ -656,13 +2063,33 @@ function initGrokRefModeUI() {
 document.addEventListener('DOMContentLoaded', () => {
   // 初始化模型显示
   updateModelUI();
+  renderPriceLineFilter();
+  updateCurrentPriceCard();
+  loadClassicPricingCatalog();
+  refreshClassicTopAccount();
   initGrokRefModeUI();
+  updateClassicRefUploadHint();
+  updateClassicGptSettingsUi();
 
-  // 同步已保存的线路值
+  const compressionInput = document.getElementById("gptOutputCompressionInput");
+  if (compressionInput) {
+    compressionInput.addEventListener("change", (event) => {
+      setClassicGptCompression(event.target.value);
+    });
+    compressionInput.addEventListener("blur", (event) => {
+      setClassicGptCompression(event.target.value);
+    });
+  }
+
+  // 同步已保存的模式值
   const savedLine = localStorage.getItem('nb_line') || '1';
   const linePill = document.getElementById('linePill');
   const lineItem = linePill?.querySelector(`[data-value="${savedLine}"]`);
-  if (lineItem) selectPill('linePill', lineItem);
+  if (lineItem) {
+    selectPill('linePill', lineItem);
+  } else {
+    selectClassicLineSilently(getLowestClassicRouteForModel(imageModel));
+  }
 });
 
 // --- Theme Logic ---
@@ -695,6 +2122,7 @@ function applyTheme(theme) {
 function toggleKeyVisibility() {
   const input = document.getElementById("apiKey");
   const btn = document.getElementById("eyeBtn");
+  if (!input || !btn) return;
   const eyeOpenPath = `<svg viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>`;
   const eyeClosedPath = `<svg viewBox="0 0 24 24"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>`;
 
@@ -713,26 +2141,35 @@ window.addEventListener("load", () => {
   initTheme();
   loadHistory();
   updateModelUI(); // 初始化模型 UI 状态
+  updateCurrentPriceCard();
+  refreshClassicTopAccount();
   initPromptTagUi();
   refreshReferencedThumbHighlight();
   const savedKey = localStorage.getItem("nb_key");
-  if (savedKey) {
-    document.getElementById("apiKey").value = savedKey;
-    document.getElementById("apiStatus").classList.add("active");
+  const apiKeyInput = document.getElementById("apiKey");
+  const apiStatus = document.getElementById("apiStatus");
+  if (savedKey && apiKeyInput) {
+    apiKeyInput.value = savedKey;
+    apiStatus?.classList.add("active");
   }
 });
 
-document.getElementById("apiKey").addEventListener("input", (e) => {
-  const val = e.target.value;
-  localStorage.setItem("nb_key", val);
-  const status = document.getElementById("apiStatus");
-  val.length > 10
-    ? status.classList.add("active")
-    : status.classList.remove("active");
+const classicApiKeyInput = document.getElementById("apiKey");
+if (classicApiKeyInput) {
+  classicApiKeyInput.addEventListener("input", (e) => {
+    const val = e.target.value;
+    localStorage.setItem("nb_key", val);
+    const status = document.getElementById("apiStatus");
+    if (status) {
+      val.length > 10
+        ? status.classList.add("active")
+        : status.classList.remove("active");
+    }
 
-  // --- [新增] 管理员权限识别 ---
-  checkAdminStatus(val);
-});
+    // --- [新增] 管理员权限识别 ---
+    checkAdminStatus(val);
+  });
+}
 
 // 管理员 Key
 const ADMIN_KEY = "sk-K9OJf52OughwT8vizrDKJpvMebzutpbKVXxxhYe8EZFF0nm7";
@@ -784,14 +2221,13 @@ function clearRefImages() {
 
 // 余额查询逻辑
 async function checkBalance() {
-  let keyRaw = document.getElementById("apiKey").value;
-  const apiKey = keyRaw.replace(/[^\x00-\x7F]/g, "").trim();
+  const apiKey = getClassicApiKey();
 
   if (!apiKey) {
     showApiGuideModal({
-      title: "请先输入 API 密钥",
-      desc: "请先在输入框填写密钥，再进行余额查询。",
-      primaryText: "去输入密钥",
+      title: "请先登录企业账号",
+      desc: "普通用户通过企业账号查看额度；API 密钥由管理员在后台维护。",
+      primaryText: "去登录",
       secondaryText: "稍后",
       action: "key",
     });
@@ -806,10 +2242,7 @@ async function checkBalance() {
 
   try {
     const res = await fetch(`/api/balance/info`, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
+      headers: buildClassicRequestHeaders(apiKey),
     });
 
     if (!res.ok) {
@@ -846,15 +2279,13 @@ async function checkBalance() {
 }
 
 function saveApiKeyAndBack() {
-  let keyRaw = document.getElementById("apiKey").value;
-  const key = keyRaw.replace(/[^\x00-\x7F]/g, "").trim();
-  if (keyRaw !== key) document.getElementById("apiKey").value = key;
+  const key = getClassicApiKey();
 
   if (!key) {
     showApiGuideModal({
-      title: "请先输入 API Key",
-      desc: "密钥不能为空，请输入后再保存。",
-      primaryText: "去输入密钥",
+      title: "请先登录企业账号",
+      desc: "普通用户无需维护 API 密钥，请登录企业账号后直接使用站内点数。",
+      primaryText: "去登录",
       secondaryText: "稍后",
       action: "key",
     });
@@ -1093,10 +2524,11 @@ async function handleFiles(files) {
   const allFiles = Array.from(files || []).filter(
     (f) => !!f && typeof f.type === "string" && f.type.startsWith("image/"),
   );
-  const remainingSlots = MAX_REF_IMAGES - refImages.length;
+  const maxRefImages = getCurrentRefImageLimit();
+  const remainingSlots = maxRefImages - refImages.length;
 
   if (remainingSlots <= 0) {
-    showSoftToast(`参考图最多 ${MAX_REF_IMAGES} 张`);
+    showSoftToast(`参考图最多 ${maxRefImages} 张`);
     return;
   }
   if (allFiles.length === 0) {
@@ -1127,7 +2559,7 @@ async function handleFiles(files) {
     console.log("Final refImages count after processing:", refImages.length);
 
     if (ignoredCount > 0) {
-      showSoftToast(`最多 ${MAX_REF_IMAGES} 张，已忽略 ${ignoredCount} 张`);
+      showSoftToast(`最多 ${maxRefImages} 张，已忽略 ${ignoredCount} 张`);
     }
 
     if (isFirstBatch && refImages.length > 0) {
@@ -1185,6 +2617,25 @@ function updateRatioOptions(forceSelectSmart = false) {
   if (!ratioPill) return;
   const menu = ratioPill.querySelector('.dropdown-menu');
   let autoItem = menu.querySelector('.dropdown-item[data-value="auto"]');
+  const getRatioIconClass = (ratioText) => {
+    const normalized = String(ratioText || "").trim().replace(/\s+/g, "");
+    const ratioClassMap = {
+      "1:1": "r-1-1",
+      "16:9": "r-16-9",
+      "9:16": "r-9-16",
+      "21:9": "r-21-9",
+      "9:21": "r-9-21",
+      "4:3": "r-4-3",
+      "3:4": "r-3-4",
+      "3:2": "r-3-2",
+      "2:3": "r-2-3",
+      "5:4": "r-5-4",
+      "4:5": "r-4-5",
+      "4:1": "r-4-1",
+      "1:4": "r-1-4",
+    };
+    return ratioClassMap[normalized] || "r-1-1";
+  };
 
   if (refImages.length > 0 && smartRatio) {
     if (!autoItem) {
@@ -1195,7 +2646,7 @@ function updateRatioOptions(forceSelectSmart = false) {
       menu.insertBefore(autoItem, menu.firstChild);
     }
     autoItem.innerHTML = `<div style="display: flex; align-items: center; gap: 10px;">
-                            <div class="ratio-icon r-1-1" style="border-style: dashed; opacity: 0.5;"></div> 
+                            <div class="ratio-icon ${getRatioIconClass(smartRatio)}"></div> 
                             <span>智能 (${smartRatio})</span>
                           </div>`;
     if (forceSelectSmart) {
@@ -1414,9 +2865,8 @@ function renderThumbs() {
 
 // --- 并发生成逻辑 ---
 async function runGen() {
-  let keyRaw = document.getElementById("apiKey").value;
-  const key = keyRaw.replace(/[^\x00-\x7F]/g, "").trim();
-  if (keyRaw !== key) document.getElementById("apiKey").value = key;
+  const key = getClassicApiKey();
+  const hasEnterpriseSession = Boolean(getClassicAuthSessionToken());
 
   const promptInput = document.getElementById("prompt");
   const rawPrompt = promptInput.value.trim();
@@ -1437,11 +2887,11 @@ async function runGen() {
   const errPlaceholder = document.getElementById("errorPlaceholder");
   const resultGrid = document.getElementById("resultGrid");
 
-    if (!key) {
+    if (!key && !hasEnterpriseSession) {
     showApiGuideModal({
-      title: "请先输入 API Key",
-      desc: "你还没有配置可用密钥，请先到“我的”页面填写 API Key，再回来开始生图。",
-      primaryText: "去输入密钥",
+      title: "请先登录企业账号",
+      desc: "武陵商厦创作平台需要登录后使用站内点数和企业模型。",
+      primaryText: "去登录",
       action: "key",
     });
     return;
@@ -1464,7 +2914,7 @@ async function runGen() {
 
   // 清空结果
   resultGrid.innerHTML = "";
-  resultGrid.className = "result-grid";
+  resultGrid.className = "result-grid classic-legacy-result-grid";
 
   // 进度条初始化
   bar.style.display = "block";
@@ -1550,6 +3000,7 @@ async function runGen() {
   }
   const basePayload = {
     model: selectedModel, // 这里使用动态选择的模型，不再使用 CONFIG.model
+    uiMode: "classic",
     prompt: finalPrompt,
     size: size.toLowerCase(), // 保持原有的转小写逻辑用于 API 参数 (1k/2k/4k)
     aspect_ratio: ratio,
@@ -1603,8 +3054,17 @@ async function runGen() {
     }
   }
 
-  // 读取线路选择
+  // 读取模式选择
   const line = (imageModel === 'nano-banana') ? (document.getElementById('linePill')?.getAttribute('data-selected-value') || '1') : '1';
+  const classicModelConfig = getClassicModelConfig(imageModel);
+  const classicRoute = getClassicSelectedRoute(classicModelConfig);
+  if (classicModelConfig?.id) {
+    basePayload.modelId = classicModelConfig.id;
+  }
+  if (classicRoute?.id) {
+    basePayload.routeId = classicRoute.id;
+  }
+  basePayload.imageSize = size.toLowerCase();
 
   // Grok：单次请求，前端双占位，轮询后映射到2张图
   if (isGrokModel) {
@@ -1661,6 +3121,7 @@ async function submitGeminiTask(basePayload, key, size, index, targetModel, runT
     }
 
     const payload = {
+      uiMode: "classic",
       model: targetModel, // 显式传入目标模型
       contents: [{ parts: parts }],
       generationConfig: {
@@ -1673,10 +3134,7 @@ async function submitGeminiTask(basePayload, key, size, index, targetModel, runT
 
     const res = await fetch('/api/gemini-generate', {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
+      headers: buildClassicRequestHeaders(key),
       body: JSON.stringify(payload),
     });
 
@@ -1705,7 +3163,7 @@ async function submitGeminiTask(basePayload, key, size, index, targetModel, runT
   } catch (error) {
     console.error(`Gemini Task ${index} Failed:`, error);
     if (canUpdateMainUi(runToken, true)) {
-      updateStatus(`线路三任务 ${index} 失败: ` + error.message);
+      updateStatus(`稳定模式任务 ${index} 失败: ` + error.message);
       activeTasksCount--;
       completedTasksCount++;
       checkAllDone(size);
@@ -1805,6 +3263,36 @@ function logGrokResponseSnippet(taskId, model, rawJson, parsedUrls = [], rawUrls
   console.warn("[GROK_DUAL_RESPONSE]", snippet);
 }
 
+function isMeaningfulClassicFailureText(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  return !["success", "succeeded", "ok", "completed"].includes(normalized);
+}
+
+function extractClassicTaskFailureMessage(rawJson, fallback = "生成失败") {
+  if (!rawJson || typeof rawJson !== "object") return fallback;
+  const candidates = [
+    rawJson.fail_reason,
+    rawJson.failReason,
+    rawJson.reason,
+    rawJson.msg,
+    rawJson.error_message,
+    rawJson.errorMessage,
+    rawJson.data?.fail_reason,
+    rawJson.data?.failReason,
+    rawJson.data?.reason,
+    rawJson.data?.msg,
+    rawJson.error?.message,
+    typeof rawJson.error === "string" ? rawJson.error : "",
+    rawJson.message,
+    rawJson.details,
+    rawJson.code,
+  ];
+  const matched = candidates.find((item) => isMeaningfulClassicFailureText(item));
+  return matched ? String(matched).trim() : fallback;
+}
+
 function markSlotFailed(slotNode, message, size) {
   if (!slotNode) {
     completedTasksCount++;
@@ -1837,10 +3325,7 @@ async function submitSingleTask(payload, key, size, index, options = {}) {
   try {
     const res = await fetch(CONFIG.submitUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
+      headers: buildClassicRequestHeaders(key),
       body: JSON.stringify(payload),
     });
 
@@ -1919,10 +3404,7 @@ async function pollSingleTask(taskId, key, size, index, options = {}) {
         CONFIG.queryUrl.replace("{id}", taskId) + `?_t=${Date.now()}`;
       const res = await fetch(queryUrl, {
         method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
+        headers: buildClassicRequestHeaders(key),
       });
 
       // --- [新增] 处理异常状态码 ---
@@ -2020,10 +3502,11 @@ async function pollSingleTask(taskId, key, size, index, options = {}) {
           clearInterval(checkLoop);
           removePendingTask(taskId);
           removePendingTaskFromGallery(taskId);
+          const failureMessage = extractClassicTaskFailureMessage(rawJson, "生成失败");
           if (canUpdateMainUi(options.runToken, trackUi)) {
             const slots = options.slotNodes || [];
-            markSlotFailed(slots[0] || null, "生成失败", size);
-            markSlotFailed(slots[1] || null, "生成失败", size);
+            markSlotFailed(slots[0] || null, failureMessage, size);
+            markSlotFailed(slots[1] || null, failureMessage, size);
           }
           logGrokResponseSnippet(taskId, options.model || "", rawJson, imageUrls, rawUrls);
           return;
@@ -2071,8 +3554,9 @@ async function pollSingleTask(taskId, key, size, index, options = {}) {
         clearInterval(checkLoop);
         removePendingTask(taskId); // [Persistence] Remove
         removePendingTaskFromGallery(taskId); // 【新增】从画廊移除占位图
+        const failureMessage = extractClassicTaskFailureMessage(rawJson, `任务 ${index} 生成失败`);
         if (canUpdateMainUi(options.runToken, trackUi)) {
-          handleSingleError(`任务 ${index} 生成失败`, size);
+          handleSingleError(failureMessage, size);
         }
       }
     } catch (err) {
@@ -2139,6 +3623,16 @@ function restorePendingTasks() {
     validTasks.forEach((t) => {
       // 在画廊中恢复占位图
       addPendingTaskToGallery(t.id, t.index);
+      if (typeof window.ensureClassicLiveTaskForPending === "function") {
+        window.ensureClassicLiveTaskForPending({
+          taskId: t.id,
+          index: t.index,
+          size: t.size,
+          modelLabel: t.model || "",
+          status: "running",
+          createdAt: t.time || Date.now(),
+        });
+      }
       if (t.mode === "grok_dual") {
         pollSingleTask(t.id, t.key, t.size, t.index, {
           mode: "grok_dual",
@@ -2203,20 +3697,7 @@ function handleSingleError(msg, size) {
     msg.includes("token quota is not enough") ||
     msg.includes("insufficient quota")
   ) {
-    msg = "你的密钥额度不足，需要充值了";
-  }
-
-  // [Fix] Content Safety / Generic Failure Advice
-  // Checked: '生成失败' (via poll), '提交失败' (via submit), 'FAILURE' (status)
-  if (
-    msg.includes("失败") ||
-    msg.includes("FAILURE") ||
-    msg.includes("FAILED")
-  ) {
-    // Avoid duplicating the advice if it's already there (though unlikely)
-    if (!msg.includes("安全限制")) {
-      msg += " (请检查提示词或参考图，可能触发了安全限制，请更换后重试)";
-    }
+    msg = "当前企业账号点数不足，请联系管理员分配额度";
   }
 
   statusText.innerText = `Warning: ${msg}`;
@@ -2329,9 +3810,37 @@ async function useAsRef(url, btnElement) {
 function appendImageToGrid(url, size, targetWrapper = null, options = {}) {
   const grid = document.getElementById("resultGrid");
   const imgContainer = document.getElementById("imgContainer");
-  const promptVal = document.getElementById("prompt")?.value?.trim() || "";
+  const promptVal =
+    String(options.promptSnapshot || options.prompt || "").trim() ||
+    document.getElementById("prompt")?.value?.trim() ||
+    "";
   const trackUi = options.trackUi !== false;
   const runToken = options.runToken || 0;
+  const liveTaskKey = String(options.liveTaskId || options.taskId || "").trim();
+
+  if (document.getElementById("classicLiveGrid")) {
+    if (liveTaskKey && typeof window.completeClassicLiveTask === "function") {
+      window.completeClassicLiveTask(liveTaskKey, url, {
+        taskId: options.taskId || liveTaskKey,
+        prompt: promptVal,
+        size,
+        modelLabel: options.modelLabel || "",
+        routeLabel: options.routeLabel || "",
+        ratio: options.ratio || "",
+        quantity: options.quantity || 0,
+        referenceCount: options.referenceCount || 0,
+      });
+    }
+    saveToHistory(url, promptVal);
+    if (canUpdateMainUi(runToken, trackUi)) {
+      loadedImageCount++;
+      completedTasksCount++;
+      activeTasksCount--;
+      checkAllDone(size);
+    }
+    if (imgContainer) imgContainer.style.display = "flex";
+    return;
+  }
 
   const wrapper = targetWrapper || document.createElement("div");
   wrapper.className = "result-item-wrapper";
@@ -2449,19 +3958,28 @@ function findAllUrlsInObject(obj, foundUrls = []) {
   if (!obj) return foundUrls;
   if (Array.isArray(obj)) {
     obj.forEach((item) => {
-      if (typeof item === "string" && item.startsWith("http"))
+      if (typeof item === "string" && (item.startsWith("http") || item.startsWith("data:")))
         foundUrls.push(item);
       else findAllUrlsInObject(item, foundUrls);
     });
     return foundUrls;
   }
   if (typeof obj === "object") {
+    if (typeof obj.b64_json === "string" && obj.b64_json.trim()) {
+      foundUrls.push(`data:image/png;base64,${obj.b64_json.trim()}`);
+    }
+    if (obj.inlineData?.data) {
+      foundUrls.push(`data:${obj.inlineData.mimeType || "image/png"};base64,${obj.inlineData.data}`);
+    }
+    if (obj.inline_data?.data) {
+      foundUrls.push(`data:${obj.inline_data.mime_type || "image/png"};base64,${obj.inline_data.data}`);
+    }
     for (let key in obj) {
       if (obj.hasOwnProperty(key)) {
         const val = obj[key];
-        if (typeof val === "string" && val.startsWith("http")) {
+        if (typeof val === "string" && (val.startsWith("http") || val.startsWith("data:"))) {
           const isImageKey = /url|image|output|result/i.test(key);
-          const isImageExt = /\.(png|jpg|jpeg|webp|gif)(\?|$)/i.test(val);
+          const isImageExt = /\.(png|jpg|jpeg|webp|gif)(\?|$)/i.test(val) || val.startsWith("data:image/");
           if (isImageKey || isImageExt) foundUrls.push(val);
         } else if (typeof val === "object") {
           findAllUrlsInObject(val, foundUrls);
@@ -2481,7 +3999,7 @@ function escapeHtml(str = "") {
     .replace(/'/g, "&#39;");
 }
 
-function saveToHistory(url, promptText = "") {
+function saveToHistory(url, promptText = "", previewUrl = "") {
   if (url.length > 5000) return;
   try {
     let history = JSON.parse(localStorage.getItem("nb_history") || "[]");
@@ -2489,15 +4007,27 @@ function saveToHistory(url, promptText = "") {
     const now = new Date();
     const timeStr = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
     const cleanPrompt = String(promptText || "").trim();
-    const newRecord = { id: genHistoryId(), url: url, time: timeStr, prompt: cleanPrompt };
-    if (history.length > 0 && history[0].url === url) return;
+    const fullUrl = String(url || "").trim();
+    const displayUrl =
+      String(previewUrl || "").trim() || getClassicLine4ThumbUrl(fullUrl) || fullUrl;
+    const newRecord = {
+      id: genHistoryId(),
+      url: fullUrl,
+      fullUrl,
+      previewUrl: displayUrl,
+      time: timeStr,
+      createdAt: now.toISOString(),
+      completedAt: now.toISOString(),
+      prompt: cleanPrompt,
+    };
+    if (history.length > 0 && getHistoryFullUrl(history[0]) === fullUrl) return;
     history.unshift(newRecord);
     // [Mod] Increased History Limit to 20
     const removed = history.length > 20 ? history.slice(20) : [];
     if (history.length > 20) history = history.slice(0, 20);
     localStorage.setItem("nb_history", JSON.stringify(history));
     loadHistory();
-    cacheHistoryImage(newRecord.id, url).then((ok) => {
+    cacheHistoryImage(newRecord.id, fullUrl).then((ok) => {
       if (ok) loadHistory();
     });
     removed.forEach((item) => removeCachedHistoryImage(item?.id));
@@ -2533,11 +4063,25 @@ function loadHistory() {
   history = history.map((item) => {
     if (typeof item === "string") {
       migrated = true;
-      return { id: genHistoryId(), url: item, time: "", prompt: "" };
+      return {
+        id: genHistoryId(),
+        url: item,
+        fullUrl: item,
+        previewUrl: getClassicLine4ThumbUrl(item) || item,
+        time: "",
+        prompt: "",
+      };
     }
     if (!item?.id) {
       migrated = true;
       return { ...item, id: genHistoryId() };
+    }
+    const fullUrl = getHistoryFullUrl(item);
+    const previewUrl =
+      String(item?.previewUrl || "").trim() || getClassicLine4ThumbUrl(fullUrl) || fullUrl;
+    if (item.fullUrl !== fullUrl || item.previewUrl !== previewUrl) {
+      migrated = true;
+      return { ...item, url: fullUrl, fullUrl, previewUrl };
     }
     return item;
   });
@@ -2569,7 +4113,8 @@ function loadHistory() {
   }
 
   history.forEach((item) => {
-    const url = typeof item === "string" ? item : item.url;
+    const url = getHistoryDisplayUrl(item);
+    const fullUrl = getHistoryFullUrl(item) || url;
     const recordId = typeof item === "object" ? item.id : "";
     // Check for time property, fallback to specific logic or empty
     const time = typeof item === "object" && item.time ? item.time : "";
@@ -2581,20 +4126,22 @@ function loadHistory() {
     const div = document.createElement("div");
     div.className = "result-item history-item"; // Inherit overlay styles
     div.title = promptLabel;
+    div.dataset.fullUrl = fullUrl;
+    div.dataset.displayUrl = url;
 
     div.innerHTML = `
-            <img src="${url}" loading="lazy" onclick="openLightbox(this.src)">
+            <img src="${url}" loading="lazy" onclick="openLightbox(this.closest('.history-item').dataset.fullUrl || this.src)">
             <!-- Timestamp Display -->
             ${time ? `<div class="history-time-tag">${time}</div>` : ""}
             <div class="history-cache-badge syncing">缓存中</div>
             ${promptTooltip}
             
             <div class="item-overlay">
-                <button class="overlay-btn history-icon-btn" data-label="放大" onclick="openLightbox(this.closest('.history-item').querySelector('img').src)">🔍</button>
-                <button class="overlay-btn history-icon-btn" data-label="保存" onclick="downloadSingleImg(this.closest('.history-item').querySelector('img').src)">💾</button>
+                <button class="overlay-btn history-icon-btn" data-label="放大" onclick="openLightbox(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">🔍</button>
+                <button class="overlay-btn history-icon-btn" data-label="保存" onclick="downloadSingleImg(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">💾</button>
                 <button class="overlay-btn history-icon-btn" data-label="重生" onclick="regenerateFromHistory('${encodedPrompt}')">♻️</button>
-                <button class="overlay-btn history-icon-btn" data-label="垫图" onclick="useAsRef(this.closest('.history-item').querySelector('img').src)">🧩</button>
-                <button class="overlay-btn history-icon-btn" data-label="链接" onclick="copyImgUrl('${url}')">🔗</button>
+                <button class="overlay-btn history-icon-btn" data-label="垫图" onclick="useAsRef(this.closest('.history-item').dataset.fullUrl || this.closest('.history-item').querySelector('img').src)">🧩</button>
+                <button class="overlay-btn history-icon-btn" data-label="链接" onclick="copyImgUrl(this.closest('.history-item').dataset.fullUrl || '${fullUrl}')">🔗</button>
             </div>
         `;
     grid.appendChild(div);
@@ -2807,7 +4354,7 @@ function switchTab(tabName) {
 
 function hasValidApiKey() {
   const key = (localStorage.getItem("nb_key") || "").trim();
-  return key.length > 10;
+  return key.length > 10 || Boolean(getClassicAuthSessionToken());
 }
 
 const API_GUIDE_DISMISSED_KEY = "classic-api-guide-dismissed-v1";
@@ -2842,8 +4389,8 @@ function showApiGuideModal(config = {}) {
   const primaryBtn = document.getElementById("apiGuidePrimaryBtn");
   const secondaryBtn = document.getElementById("apiGuideSecondaryBtn");
 
-  const title = config.title || "请先输入 API Key";
-  const desc = config.desc || "首次使用请先配置密钥。";
+  const title = config.title || "请先登录企业账号";
+  const desc = config.desc || "首次使用请先登录武陵商厦企业账号。";
   const primaryText = config.primaryText || "去设置";
   const secondaryText = config.secondaryText || "稍后";
   const showSecondary = config.showSecondary !== false;
@@ -2891,9 +4438,9 @@ function updateApiGuidePrompt(force = false) {
     return;
   }
   showApiGuideModal({
-    title: "欢迎使用，先完成 1 步配置",
-    desc: "检测到你还没有输入 API Key。先在“我的”页填写密钥，完成后即可直接开始生图。",
-    primaryText: "去输入密钥",
+    title: "欢迎使用，先完成登录",
+    desc: "检测到你还没有登录企业账号。登录后即可使用站内点数开始创作。",
+    primaryText: "去登录",
     action: "key",
     autoPrompt: true,
   });
@@ -3012,7 +4559,7 @@ async function tryBackfillHistoryCache() {
   }
 }
 
-// 监听 API Key 输入
+// 兼容旧版密钥输入
 const apiKeyInput = document.getElementById("apiKey");
 if (apiKeyInput) {
   apiKeyInput.addEventListener("input", (e) => {
@@ -3448,10 +4995,7 @@ async function publishAnnouncement() {
   try {
     const res = await fetch("/api/announcement", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
+      headers: buildClassicRequestHeaders(key),
       body: JSON.stringify({ content }),
     });
 

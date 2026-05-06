@@ -42,6 +42,10 @@ interface SelectionStore {
   brushSize: number;
   brushColor: string;
   imageLine: string;
+  gptImageQuality: 'auto' | 'low' | 'medium' | 'high';
+  gptImageOutputFormat: 'png' | 'jpeg' | 'webp';
+  gptImageOutputCompression: number | null;
+  gptImageModeration: 'auto' | 'low';
   grokReferenceMode: 'stable_fusion' | 'classic_multi';
   autoDownloadOnSuccess: boolean;
 
@@ -83,6 +87,10 @@ interface SelectionStore {
   setBrushSize: (size: number) => void;
   setBrushColor: (color: string) => void;
   setImageLine: (line: string) => void;
+  setGptImageQuality: (quality: 'auto' | 'low' | 'medium' | 'high') => void;
+  setGptImageOutputFormat: (format: 'png' | 'jpeg' | 'webp') => void;
+  setGptImageOutputCompression: (compression: number | null) => void;
+  setGptImageModeration: (moderation: 'auto' | 'low') => void;
   setGrokReferenceMode: (mode: 'stable_fusion' | 'classic_multi') => void;
   setAutoDownloadOnSuccess: (enabled: boolean) => void;
 
@@ -96,10 +104,6 @@ interface SelectionStore {
   toggleTooltips: () => void;
   setControlPanelOpen: (open: boolean) => void;
   toggleControlPanel: () => void;
-  
-  // Inpaint Window State
-  isInpaintWindowOpen: boolean;
-  setInpaintWindowOpen: (open: boolean) => void;
 
   // Actions - Context Menu
   setContextMenu: (menu: { x: number; y: number; nodeId: string } | null) => void;
@@ -192,7 +196,6 @@ export const useSelectionStore = create<SelectionStore>()(
       showLayers: true,
       showTooltips: true,
       isControlPanelOpen: true,
-      isInpaintWindowOpen: false,
       panelMode: 'IMAGE',
       contextMenu: null,
       lightboxImage: null,
@@ -216,6 +219,10 @@ export const useSelectionStore = create<SelectionStore>()(
       brushSize: 40,
       brushColor: '#A855F7', // Purple default
       imageLine: 'line1',
+      gptImageQuality: 'auto',
+      gptImageOutputFormat: 'png',
+      gptImageOutputCompression: null,
+      gptImageModeration: 'auto',
       grokReferenceMode: 'stable_fusion',
       autoDownloadOnSuccess: true,
 
@@ -280,13 +287,19 @@ export const useSelectionStore = create<SelectionStore>()(
       setCustomRatio: (val) => set(state => { state.customRatio = val; }),
       setImageSize: (val) => set(state => { state.imageSize = val; }),
       setThinkingLevel: (val) => set(state => { state.thinkingLevel = val; }),
-      setQuantity: (val) => set(state => { state.quantity = val; }),
+      setQuantity: (val) => set(state => {
+        state.quantity = [1, 2, 4, 8, 16].includes(Number(val)) ? Number(val) : 1;
+      }),
       setVideoAspectRatio: (val) => set(state => { state.videoAspectRatio = val; }),
       setVideoDuration: (val) => set(state => { state.videoDuration = val; }),
       setVideoHd: (val) => set(state => { state.videoHd = val; }),
       setBrushSize: (val) => set(state => { state.brushSize = val; }),
       setBrushColor: (val) => set(state => { state.brushColor = val; }),
       setImageLine: (val) => set(state => { state.imageLine = val; }),
+      setGptImageQuality: (val) => set(state => { state.gptImageQuality = val; }),
+      setGptImageOutputFormat: (val) => set(state => { state.gptImageOutputFormat = val; }),
+      setGptImageOutputCompression: (val) => set(state => { state.gptImageOutputCompression = val; }),
+      setGptImageModeration: (val) => set(state => { state.gptImageModeration = val; }),
       setGrokReferenceMode: (val) => set(state => { state.grokReferenceMode = val; }),
       setAutoDownloadOnSuccess: (val) => set(state => { state.autoDownloadOnSuccess = val; }),
 
@@ -307,14 +320,12 @@ export const useSelectionStore = create<SelectionStore>()(
           if (mode === ToolMode.VIDEO) {
               state.panelMode = 'VIDEO';
               state.isControlPanelOpen = true; // Auto-open panel
-              state.isInpaintWindowOpen = false;
           } else if (mode === ToolMode.GENERATE) {
               state.panelMode = 'IMAGE';
               state.isControlPanelOpen = true; // Auto-open panel
-              state.isInpaintWindowOpen = false;
           } else if (mode === ToolMode.INPAINT) {
-              state.isControlPanelOpen = false;
-              state.isInpaintWindowOpen = true;
+              state.panelMode = 'IMAGE';
+              state.isControlPanelOpen = true;
           }
         }),
 
@@ -343,17 +354,6 @@ export const useSelectionStore = create<SelectionStore>()(
       setControlPanelOpen: (open) =>
         set((state) => {
           state.isControlPanelOpen = open;
-          if (open) {
-            state.isInpaintWindowOpen = false;
-          }
-        }),
-
-      setInpaintWindowOpen: (open) =>
-        set((state) => {
-          state.isInpaintWindowOpen = open;
-          if (open) {
-            state.isControlPanelOpen = false;
-          }
         }),
 
       // Actions - Context Menu
@@ -427,6 +427,8 @@ export const useSelectionStore = create<SelectionStore>()(
               const isVideoMode = state.panelMode === 'VIDEO' || state.toolMode === ToolMode.VIDEO;
               if (isVideoMode) {
                    max = getVideoModelMaxReferenceImages(state.videoModel);
+              } else if (state.imageModel === 'gpt-image-2') {
+                   max = 16;
               }
 
               if (state.referenceImages.length < max) {
@@ -481,6 +483,8 @@ export const useSelectionStore = create<SelectionStore>()(
                    const isVideoMode = state.panelMode === 'VIDEO' || state.toolMode === ToolMode.VIDEO;
                    if (isVideoMode) {
                        limit = getVideoModelMaxReferenceImages(state.videoModel);
+                   } else if (state.imageModel === 'gpt-image-2') {
+                       limit = 16;
                    }
               }
               
@@ -578,6 +582,10 @@ export const useSelectionStore = create<SelectionStore>()(
         panelMode: state.panelMode,
         isControlPanelOpen: state.isControlPanelOpen,
         imageLine: state.imageLine,
+        gptImageQuality: state.gptImageQuality,
+        gptImageOutputFormat: state.gptImageOutputFormat,
+        gptImageOutputCompression: state.gptImageOutputCompression,
+        gptImageModeration: state.gptImageModeration,
         grokReferenceMode: state.grokReferenceMode,
         autoDownloadOnSuccess: state.autoDownloadOnSuccess
       }),

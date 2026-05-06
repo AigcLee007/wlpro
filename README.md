@@ -24,8 +24,8 @@ View your app in AI Studio: https://ai.studio/apps/drive/1MB-T6-X8pVklMaEwAk7UBH
    `MYSQL_URL`
    or `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE`
    If you use docker-compose, the default host-side ports are:
-   `PORT=3355`
-   `MYSQL_HOST_PORT=3308`
+   `PORT=3365`
+   `MYSQL_HOST_PORT=3310`
 4. Start the app:
    `npm run start`
 
@@ -43,8 +43,8 @@ This project uses SMTP for email login codes, so Resend works out of the box thr
 ### Default ports
 
 - `5188` - Vite frontend dev server
-- `3355` - Node.js backend / BaoTa reverse proxy target
-- `3308` - Host-side MySQL bind for docker-compose
+- `3365` - Node.js backend / BaoTa reverse proxy target
+- `3310` - Host-side MySQL bind for docker-compose
 
 ## MySQL migration
 

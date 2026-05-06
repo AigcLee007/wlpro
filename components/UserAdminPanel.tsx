@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+﻿import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Coins,
   Crown,
@@ -12,8 +12,6 @@ import { AuthSessionPayload } from '../src/services/accountIdentity';
 import {
   fetchAdminUserDetail,
   fetchAdminUsers,
-  resetAdminUserPassword,
-  setAdminUserStatus,
   updateAdminUserProfile,
   type AdminUserDetailPayload,
   type AdminUserListPayload,
@@ -28,7 +26,7 @@ interface UserAdminPanelProps {
 
 const typeLabelMap: Record<string, string> = {
   signup: '注册赠送',
-  recharge: '管理员充值',
+  recharge: '管理员分配',
   charge: '生成扣点',
   refund: '失败退款',
   admin_credit: '管理员加点',
@@ -61,11 +59,13 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
   const [searchKeyword, setSearchKeyword] = useState('');
   const [page, setPage] = useState(1);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const selectedUserIdRef = React.useRef<string | null>(null);
   const [ledgerPage, setLedgerPage] = useState(1);
 
   const [editDisplayName, setEditDisplayName] = useState('');
   const [editRole, setEditRole] = useState<'user' | 'admin' | 'super_admin'>('user');
   const [editStatus, setEditStatus] = useState<'active' | 'disabled'>('active');
+  const [editAdminNote, setEditAdminNote] = useState('');
   const [adjustDelta, setAdjustDelta] = useState('100');
   const [adjustNote, setAdjustNote] = useState('');
 
@@ -73,7 +73,12 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
     setEditDisplayName(payload?.user?.displayName || '');
     setEditRole((payload?.user?.role || 'user') as 'user' | 'admin' | 'super_admin');
     setEditStatus((payload?.user?.status || 'active') as 'active' | 'disabled');
+    setEditAdminNote(payload?.user?.adminNote || '');
   }, []);
+
+  useEffect(() => {
+    selectedUserIdRef.current = selectedUserId;
+  }, [selectedUserId]);
 
   const loadDetail = useCallback(
     async (userId: string, nextLedgerPage = 1) => {
@@ -129,13 +134,9 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
         setPage(next.page);
 
         const nextSelectedUserId =
-          preferredUserId || selectedUserId || next.users[0]?.userId || null;
+          preferredUserId || selectedUserIdRef.current || next.users[0]?.userId || null;
         if (nextSelectedUserId) {
-          const existingUser =
-            next.users.find((item) => item.userId === nextSelectedUserId) || next.users[0];
-          if (existingUser?.userId) {
-            await loadDetail(existingUser.userId, 1);
-          }
+          await loadDetail(nextSelectedUserId, 1);
         } else {
           setDetail(null);
           setSelectedUserId(null);
@@ -146,7 +147,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
         setLoading(false);
       }
     },
-    [isAdmin, loadDetail, page, searchKeyword, selectedUserId],
+    [isAdmin, loadDetail, page, searchKeyword],
   );
 
   useEffect(() => {
@@ -157,6 +158,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
     () => catalog?.users.find((item) => item.userId === selectedUserId) || null,
     [catalog, selectedUserId],
   );
+  const onlineUsers = catalog?.onlineUsers || [];
 
   const handleSaveProfile = async () => {
     if (!detail || !isSuperAdmin) return;
@@ -169,6 +171,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
         displayName: editDisplayName.trim(),
         role: editRole,
         status: editStatus,
+        adminNote: editAdminNote.trim(),
         ledgerPage,
         ledgerPageSize: 20,
       });
@@ -226,80 +229,61 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
     }
   };
 
-  const syncUserInCatalog = useCallback((next: AdminUserDetailPayload) => {
-    setCatalog((prev) =>
-      prev
-        ? {
-            ...prev,
-            users: prev.users.map((item) =>
-              item.userId === next.user.userId
-                ? { ...item, ...next.user, account: next.account }
-                : item,
-            ),
-          }
-        : prev,
-    );
-  }, []);
-
-  const handleResetPassword = async () => {
-    if (!detail) return;
-    const confirmed = window.confirm(
-      `确认将该用户密码重置为 1234567890 吗？\n用户：${detail.user.email}`,
-    );
-    if (!confirmed) return;
-
-    setSaving(true);
-    setError(null);
-    try {
-      const next = await resetAdminUserPassword({
-        userId: detail.user.userId,
-        ledgerPage,
-        ledgerPageSize: 20,
-      });
-      setDetail(next);
-      syncEditor(next);
-      syncUserInCatalog(next);
-      toast.success('已重置密码为 1234567890');
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleToggleUserStatus = async () => {
-    if (!detail) return;
-    const nextStatus = detail.user.status === 'active' ? 'disabled' : 'active';
-    const confirmed = window.confirm(
-      nextStatus === 'disabled'
-        ? `确认停用该用户吗？\n用户：${detail.user.email}`
-        : `确认启用该用户吗？\n用户：${detail.user.email}`,
-    );
-    if (!confirmed) return;
-
-    setSaving(true);
-    setError(null);
-    try {
-      const next = await setAdminUserStatus({
-        userId: detail.user.userId,
-        status: nextStatus,
-        ledgerPage,
-        ledgerPageSize: 20,
-      });
-      setDetail(next);
-      syncEditor(next);
-      syncUserInCatalog(next);
-      toast.success(nextStatus === 'disabled' ? '用户已停用' : '用户已启用');
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
   if (!isAdmin) {
     return null;
   }
+
+  const renderUserCard = (
+    user: NonNullable<AdminUserListPayload['users']>[number],
+    { compact = false }: { compact?: boolean } = {},
+  ) => (
+    <button
+      key={`${compact ? 'online' : 'list'}-${user.userId}`}
+      type="button"
+      onClick={() => void loadDetail(user.userId, 1)}
+      className={`w-full rounded-2xl border px-3 text-left transition-colors ${
+        compact ? 'py-2.5' : 'py-3'
+      } ${
+        selectedUserId === user.userId
+          ? 'border-fuchsia-400/40 bg-fuchsia-500/10'
+          : 'border-white/5 bg-white/[0.03] hover:bg-white/[0.06]'
+      }`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="truncate text-sm font-medium text-gray-100">
+              {user.displayName || user.email}
+            </span>
+            {user.isOnline ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-200">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
+                在线
+              </span>
+            ) : null}
+            {user.isSuperAdmin ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-yellow-500/15 px-2 py-0.5 text-[10px] text-yellow-200">
+                <Crown size={10} />
+                超级管理员              </span>
+            ) : user.isAdmin ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-200">
+                <ShieldCheck size={10} />
+                管理员              </span>
+            ) : null}
+          </div>
+          <div className="mt-1 truncate text-[11px] text-gray-400">{user.email}</div>
+          <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-gray-500">
+            <span>{user.status === 'active' ? '已启用' : '已停用'}</span>
+            <span>余额 {formatPoint(user.account?.points ?? 0)}</span>
+            <span>消费 {formatPoint(user.account?.totalSpent ?? 0)}</span>
+            {user.lastSeenAt ? (
+              <span>活跃 {new Date(user.lastSeenAt).toLocaleTimeString()}</span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </button>
+  );
 
   return (
     <div className="space-y-4 rounded-3xl border border-fuchsia-500/20 bg-linear-to-br from-fuchsia-500/10 via-fuchsia-500/5 to-transparent p-5">
@@ -331,8 +315,8 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[0.9fr_1.1fr]">
-        <div className="space-y-3 rounded-2xl border border-white/10 bg-black/20 p-4">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[420px_minmax(0,1fr)]">
+        <div className="min-w-0 space-y-3 rounded-2xl border border-white/10 bg-black/20 p-4">
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Search
@@ -367,51 +351,33 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
           <div className="flex items-center justify-between text-[11px] text-gray-400">
             <span>共 {catalog?.total || 0} 位用户</span>
             <span>
-              第 {catalog?.page || 1} / {catalog?.totalPages || 1} 页
-            </span>
+              第 {catalog?.page || 1} / {catalog?.totalPages || 1} 页</span>
           </div>
 
-          <div className="max-h-[560px] space-y-2 overflow-y-auto pr-1">
+          <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/8 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium text-emerald-100">
+                当前在线用户
+                <span className="ml-2 text-[11px] text-emerald-200/70">
+                  {catalog?.onlineTotal || 0} 人</span>
+              </div>
+              <div className="text-[11px] text-emerald-200/60">
+                {catalog?.onlineWindowMinutes || 5} 分钟内活跃</div>
+            </div>
+            <div className="mt-3 max-h-56 space-y-2 overflow-y-auto pr-1">
+              {onlineUsers.length ? (
+                onlineUsers.map((user) => renderUserCard(user, { compact: true }))
+              ) : (
+                <div className="rounded-xl border border-white/5 bg-black/20 px-3 py-5 text-center text-xs text-emerald-100/70">
+                  当前没有在线用户
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="max-h-[560px] space-y-2 overflow-y-auto pr-1 [scrollbar-gutter:stable]">
             {catalog?.users?.length ? (
-              catalog.users.map((user) => (
-                <button
-                  key={user.userId}
-                  type="button"
-                  onClick={() => void loadDetail(user.userId, 1)}
-                  className={`w-full rounded-2xl border px-3 py-3 text-left transition-colors ${
-                    selectedUserId === user.userId
-                      ? 'border-fuchsia-400/40 bg-fuchsia-500/10'
-                      : 'border-white/5 bg-white/[0.03] hover:bg-white/[0.06]'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-sm font-medium text-gray-100">
-                          {user.displayName || user.email}
-                        </span>
-                        {user.isSuperAdmin ? (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-yellow-500/15 px-2 py-0.5 text-[10px] text-yellow-200">
-                            <Crown size={10} />
-                            超级管理员
-                          </span>
-                        ) : user.isAdmin ? (
-                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-200">
-                            <ShieldCheck size={10} />
-                            管理员
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="mt-1 truncate text-[11px] text-gray-400">{user.email}</div>
-                      <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-gray-500">
-                        <span>{user.status === 'active' ? '已启用' : '已停用'}</span>
-                        <span>余额 {formatPoint(user.account?.points ?? 0)}</span>
-                        <span>消费 {formatPoint(user.account?.totalSpent ?? 0)}</span>
-                      </div>
-                    </div>
-                  </div>
-                </button>
-              ))
+              catalog.users.map((user) => renderUserCard(user))
             ) : (
               <div className="rounded-2xl border border-white/5 bg-white/[0.03] px-3 py-8 text-center text-xs text-gray-500">
                 暂无匹配用户
@@ -431,8 +397,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
               disabled={page <= 1 || loading}
               className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 hover:bg-white/10 disabled:opacity-40"
             >
-              上一页
-            </button>
+              上一页            </button>
             <button
               type="button"
               onClick={() =>
@@ -444,12 +409,11 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
               disabled={page >= (catalog?.totalPages || 1) || loading}
               className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 hover:bg-white/10 disabled:opacity-40"
             >
-              下一页
-            </button>
+              下一页            </button>
           </div>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+        <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-4">
           {detailLoading ? (
             <div className="flex min-h-[240px] items-center justify-center gap-2 text-sm text-gray-300">
               <Loader2 size={16} className="animate-spin" />
@@ -457,35 +421,6 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
             </div>
           ) : detail ? (
             <div className="space-y-4">
-              {isAdmin && detail.user.role === 'user' && (
-                <div className="rounded-2xl border border-cyan-400/20 bg-cyan-500/10 p-4">
-                  <div className="mb-2 text-sm font-medium text-cyan-100">管理员快捷操作</div>
-                  <p className="mb-3 text-xs text-cyan-100/80">
-                    可对普通用户执行：重置密码为 1234567890、启用/停用账号。
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleResetPassword()}
-                      disabled={saving}
-                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-cyan-300/30 bg-cyan-500/20 px-4 text-sm font-medium text-cyan-50 hover:bg-cyan-500/30 disabled:opacity-60"
-                    >
-                      {saving ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-                      重置密码(1234567890)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleToggleUserStatus()}
-                      disabled={saving}
-                      className="inline-flex h-10 items-center gap-2 rounded-xl border border-amber-300/30 bg-amber-500/20 px-4 text-sm font-medium text-amber-100 hover:bg-amber-500/30 disabled:opacity-60"
-                    >
-                      {saving ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-                      {detail.user.status === 'active' ? '停用账号' : '启用账号'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
               <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3">
                   <div className="text-[11px] uppercase tracking-wider text-gray-500">当前用户</div>
@@ -519,13 +454,13 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-4 xl:grid-cols-[0.9fr_1.1fr]">
-                <div className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+                <div className="min-w-0 space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
                   <div className="text-xs font-medium text-gray-300">用户资料</div>
 
                   <div>
                     <label className="mb-1 block text-[11px] uppercase tracking-wider text-gray-500">
-                      显示名称
+                      鏄剧ず鍚嶇О
                     </label>
                     <input
                       value={editDisplayName}
@@ -571,6 +506,21 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
                       </select>
                     </div>
                   </div>
+
+                  {isSuperAdmin && (
+                    <div>
+                      <label className="mb-1 block text-[11px] uppercase tracking-wider text-gray-500">
+                        管理备注
+                      </label>
+                      <textarea
+                        value={editAdminNote}
+                        onChange={(event) => setEditAdminNote(event.target.value)}
+                        maxLength={2000}
+                        placeholder="仅超级管理员可见，可记录来源、风险、沟通记录等"
+                        className="min-h-24 w-full resize-y rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm leading-6 text-white placeholder:text-gray-500 focus:border-white/20 focus:outline-none"
+                      />
+                    </div>
+                  )}
 
                   <div className="space-y-1 text-[11px] text-gray-400">
                     <div>
@@ -626,7 +576,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
                   )}
                 </div>
 
-                <div className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+                <div className="min-w-0 space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-xs font-medium text-gray-300">消费流水</div>
                     <div className="text-[11px] text-gray-500">共 {detail.ledger.total} 条</div>
@@ -657,7 +607,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
                             <span>余额 {formatPoint(entry.balanceAfter)}</span>
                           </div>
                           {entry.meta && (
-                            <div className="mt-2 text-[11px] text-gray-400">
+                            <div className="mt-2 break-all text-[11px] text-gray-400">
                               {[
                                 String(entry.meta.routeId || ''),
                                 String(entry.meta.action || entry.meta.actionName || ''),
@@ -701,8 +651,7 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
                       disabled={ledgerPage >= detail.ledger.totalPages || detailLoading}
                       className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 hover:bg-white/10 disabled:opacity-40"
                     >
-                      下一页
-                    </button>
+                      下一页                    </button>
                   </div>
                 </div>
               </div>
@@ -719,3 +668,8 @@ const UserAdminPanel: React.FC<UserAdminPanelProps> = ({ session }) => {
 };
 
 export default UserAdminPanel;
+
+
+
+
+
