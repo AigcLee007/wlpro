@@ -328,6 +328,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const [authSession, setAuthSession] = useState<AuthSessionPayload | null>(null);
   const isRemoteHistoryEnabled = authSession?.authenticated === true;
+  const [historyMediaType, setHistoryMediaType] = useState<'image' | 'video'>('image');
 
   const mapGenerationRecordToLog = useCallback((record: {
     id: string;
@@ -415,7 +416,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     void refreshRemoteHistory();
   }, [activeTab, authSession?.authenticated, isOpen, refreshRemoteHistory]);
 
-  const [historyMediaType, setHistoryMediaType] = useState<'image' | 'video'>('image');
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 640);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const historyScrollDebounceRef = useRef<number | null>(null);
