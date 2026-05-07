@@ -48,7 +48,7 @@ interface ImageFormConfigProps {
 export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
   restrictToDirectKeyCompatible = false,
 }) => {
-  useImageRouteCatalog();
+  const { routes: loadedImageRoutes } = useImageRouteCatalog();
   useImageModelCatalog();
 
   const {
@@ -114,13 +114,19 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
   const showLineSelector = availableRoutes.length > 1;
   const showSizeSelector = shouldShowImageSizeSelector(currentModel.id);
   const isGptImage2 = currentModel.id === 'gpt-image-2';
-  const selectedRoute = getSelectedImageRoute(currentModel.id, imageLine);
+  const selectedRoute = useMemo(
+    () =>
+      availableRoutes.find((route) => route.line === imageLine) ||
+      getSelectedImageRoute(currentModel.id, imageLine),
+    [availableRoutes, currentModel.id, imageLine, loadedImageRoutes],
+  );
   const sizeOptions = getImageRouteSizeOptions(selectedRoute, baseSizeOptions);
   const effectiveSize = sizeOptions.includes(normalizedSize)
     ? normalizedSize
     : sizeOptions[0] || getDefaultImageSizeForModel(currentModel.id);
   const currentUnitCost = getImageRoutePointCost(selectedRoute, effectiveSize);
-  const currentTotalCost = currentUnitCost * Math.max(1, Number(quantity || 1));
+  const currentQuantity = Math.max(1, Number(quantity || 1));
+  const currentTotalCost = currentUnitCost * currentQuantity;
 
   const commitGptCompression = (value: string) => {
     const trimmed = value.trim();
@@ -398,7 +404,7 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
           <div className="min-w-0">
             <div className="text-[10px] text-gray-400">当前配置消耗</div>
             <div className="mt-0.5 truncate text-[11px] text-gray-500">
-              {currentModel.label} / {selectedRoute.label} / {effectiveSize.toUpperCase()} / {quantity} 张
+              {currentModel.label} / {selectedRoute.label} / {effectiveSize.toUpperCase()} / {currentQuantity} 张
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5 rounded-lg border border-yellow-400/20 bg-black/20 px-2.5 py-1.5 text-sm font-semibold text-yellow-300">
