@@ -114,8 +114,8 @@ const normalizeStaticRoute = (route, index) => ({
   api_key_env: trimToNull(route.apiKeyEnv),
   point_cost: parsePoint(route.pointCost, 0),
   size_overrides: stringifySizeOverrides(route.sizeOverrides),
-  sort_order: index,
-  is_active: true,
+  sort_order: parseInteger(route.sortOrder, index),
+  is_active: parseBoolean(route.isActive, true),
   is_default_route:
     trimToString(route.id) === trimToString(staticCatalog.defaultRouteId || ""),
   is_default_nano_banana_line:
@@ -129,6 +129,10 @@ const buildStaticRows = () =>
   Array.isArray(staticCatalog.routes)
     ? staticCatalog.routes.map((route, index) => normalizeStaticRoute(route, index))
     : [];
+const getStaticRouteIds = () =>
+  buildStaticRows()
+    .map((row) => trimToString(row.route_id))
+    .filter(Boolean);
 
 const getStaticRouteDefaults = (routeId) =>
   buildStaticRows().find((row) => trimToString(row.route_id) === trimToString(routeId)) || null;
@@ -378,42 +382,15 @@ const ensureImageRouteSchema = async () => {
       );
 
       await withTransaction(async (connection) => {
-        const [countRows] = await connection.execute(
-          "SELECT COUNT(*) AS total FROM image_routes",
-        );
-        const hasExistingRoutes = Number(countRows?.[0]?.total || 0) > 0;
-        const [existingRows] = hasExistingRoutes
-          ? await connection.execute(
-              "SELECT route_id, model_family, line_value FROM image_routes",
-            )
-          : [[]];
-        const existingRouteIds = new Set(
-          (Array.isArray(existingRows) ? existingRows : []).map((row) =>
-            trimToString(row.route_id),
-          ),
-        );
-        const existingFamilyLines = new Set(
-          (Array.isArray(existingRows) ? existingRows : []).map(
-            (row) => `${trimToString(row.model_family)}\u0000${trimToString(row.line_value)}`,
-          ),
-        );
+        const routeIds = getStaticRouteIds();
+        if (routeIds.length > 0) {
+          await connection.execute(
+            `DELETE FROM image_routes WHERE route_id NOT IN (${routeIds.map(() => "?").join(", ")})`,
+            routeIds,
+          );
+        }
 
-        const rows = buildStaticRows().filter(
-          (row) => {
-            if (!hasExistingRoutes) return true;
-            const routeId = trimToString(row.route_id);
-            if (existingRouteIds.has(routeId)) return false;
-            if (
-              row.model_family === "gpt-image-2" &&
-              ["gpt-image-2-default", "gpt-image-2-line2"].includes(routeId)
-            ) {
-              return true;
-            }
-            return !existingFamilyLines.has(
-              `${trimToString(row.model_family)}\u0000${trimToString(row.line_value)}`,
-            );
-          },
-        );
+        const rows = buildStaticRows();
         for (const row of rows) {
           await connection.execute(
             `
@@ -425,6 +402,29 @@ const ensureImageRouteSchema = async () => {
                 api_key, api_key_env, point_cost, size_overrides, sort_order, is_active,
                 is_default_route, is_default_nano_banana_line, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                label = VALUES(label),
+                description = VALUES(description),
+                model_family = VALUES(model_family),
+                line_value = VALUES(line_value),
+                transport = VALUES(transport),
+                mode = VALUES(mode),
+                base_url = VALUES(base_url),
+                generate_path = VALUES(generate_path),
+                task_path = VALUES(task_path),
+                edit_path = VALUES(edit_path),
+                chat_path = VALUES(chat_path),
+                upstream_model = VALUES(upstream_model),
+                use_request_model = VALUES(use_request_model),
+                allow_user_api_key_without_login = VALUES(allow_user_api_key_without_login),
+                api_key_env = VALUES(api_key_env),
+                point_cost = VALUES(point_cost),
+                size_overrides = VALUES(size_overrides),
+                sort_order = VALUES(sort_order),
+                is_active = VALUES(is_active),
+                is_default_route = VALUES(is_default_route),
+                is_default_nano_banana_line = VALUES(is_default_nano_banana_line),
+                updated_at = VALUES(updated_at)
             `,
             [
               row.route_id,

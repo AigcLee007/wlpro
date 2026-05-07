@@ -1,5 +1,5 @@
 {
-  "defaultRouteId": "openai-image-default",
+  "defaultRouteId": "nano-banana-pro-line1",
   "defaultNanoBananaLine": "line1",
   "routes": [
     {
@@ -17,7 +17,8 @@
       "upstreamModel": "nano-banana-pro",
       "allowUserApiKeyWithoutLogin": true,
       "apiKeyEnv": "IMAGE_ROUTE_NANO_BANANA_PRO_LINE1_KEY",
-      "pointCost": 10
+      "pointCost": 10,
+      "sortOrder": 10
     },
     {
       "id": "nano-banana-pro-line2",
@@ -31,12 +32,13 @@
       "generatePath": "/v1beta/models/{model}:generateContent",
       "upstreamModel": "gemini-3-pro-image-preview",
       "apiKeyEnv": "IMAGE_ROUTE_NANO_BANANA_PRO_LINE2_KEY",
-      "pointCost": 18
+      "pointCost": 18,
+      "sortOrder": 20
     },
     {
       "id": "nano-banana-pro-line3",
       "label": "Line 3",
-      "description": "02Studio Gemini sync image generation",
+      "description": "02Studio Gemini sync image generation, executed as local background task",
       "modelFamily": "nano-banana",
       "line": "line3",
       "transport": "gemini-native",
@@ -45,12 +47,13 @@
       "generatePath": "/v1beta/models/{model}:generateContent",
       "upstreamModel": "gemini-3.0-pro-image",
       "apiKeyEnv": "IMAGE_ROUTE_NANO_BANANA_PRO_LINE3_KEY",
-      "pointCost": 20
+      "pointCost": 20,
+      "sortOrder": 30
     },
     {
       "id": "nano-banana-pro-line4",
       "label": "Line 4",
-      "description": "Visionary openai-image sync generation",
+      "description": "Visionary openai-image sync generation, executed as local background task",
       "modelFamily": "nano-banana",
       "line": "line4",
       "transport": "openai-image",
@@ -77,23 +80,6 @@
         }
       },
       "sortOrder": 40
-    },
-    {
-      "id": "openai-image-default",
-      "label": "Default Route",
-      "description": "Default async image generation route",
-      "modelFamily": "default",
-      "line": "default",
-      "transport": "openai-image",
-      "mode": "async",
-      "baseUrl": "https://api.bltcy.ai",
-      "generatePath": "/v1/images/generations?async=true",
-      "taskPath": "/v1/images/tasks/{taskId}",
-      "editPath": "/v1/images/edits?async=true",
-      "useRequestModel": true,
-      "allowUserApiKeyWithoutLogin": true,
-      "apiKeyEnv": "IMAGE_ROUTE_DEFAULT_KEY",
-      "pointCost": 12
     },
     {
       "id": "gpt-image-2-default",
@@ -130,7 +116,7 @@
     {
       "id": "gpt-image-2-line2",
       "label": "Line 2",
-      "description": "GPT-image-2 PixelleLabs sync image generation route",
+      "description": "GPT-image-2 PixelleLabs sync image generation, executed as local background task",
       "modelFamily": "gpt-image-2",
       "line": "line2",
       "transport": "openai-image",

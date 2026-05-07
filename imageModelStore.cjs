@@ -102,6 +102,10 @@ const buildStaticRows = () =>
   Array.isArray(staticCatalog.models)
     ? staticCatalog.models.map((model, index) => normalizeStaticModel(model, index))
     : [];
+const getStaticModelIds = () =>
+  buildStaticRows()
+    .map((row) => trimToString(row.model_id))
+    .filter(Boolean);
 const getStaticModelDefaults = (modelId) =>
   buildStaticRows().find((row) => trimToString(row.model_id) === trimToString(modelId)) || null;
 
@@ -255,30 +259,70 @@ const ensureImageModelSchema = async () => {
       }
 
       await withTransaction(async (connection) => {
-        const [countRows] = await connection.execute(
-          "SELECT COUNT(*) AS total FROM image_models",
-        );
         const nowDb = toDbDateTime();
         const rows = buildStaticRows();
 
-        if (Number(countRows?.[0]?.total || 0) === 0) {
-          for (const row of rows) {
-            await insertStaticModelRow(connection, row, nowDb);
-          }
-          return;
+        const staticModelIds = getStaticModelIds();
+        if (staticModelIds.length > 0) {
+          await connection.execute(
+            `DELETE FROM image_models WHERE model_id NOT IN (${staticModelIds.map(() => "?").join(", ")})`,
+            staticModelIds,
+          );
         }
 
-        const [existingRows] = await connection.execute("SELECT model_id FROM image_models");
-        const existingModelIds = new Set(
-          (Array.isArray(existingRows) ? existingRows : []).map((row) =>
-            trimToString(row.model_id),
-          ),
-        );
-
         for (const row of rows) {
-          if (!existingModelIds.has(trimToString(row.model_id))) {
-            await insertStaticModelRow(connection, row, nowDb);
-          }
+          await connection.execute(
+            `
+              INSERT INTO image_models (
+                model_id, label, description, model_family, route_family,
+                request_model, selector_cost, icon_kind, panel_layout, size_behavior,
+                default_size, size_options_json, extra_aspect_ratios_json,
+                show_size_selector, supports_custom_ratio, is_active,
+                is_default_model, sort_order, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                label = VALUES(label),
+                description = VALUES(description),
+                model_family = VALUES(model_family),
+                route_family = VALUES(route_family),
+                request_model = VALUES(request_model),
+                selector_cost = VALUES(selector_cost),
+                icon_kind = VALUES(icon_kind),
+                panel_layout = VALUES(panel_layout),
+                size_behavior = VALUES(size_behavior),
+                default_size = VALUES(default_size),
+                size_options_json = VALUES(size_options_json),
+                extra_aspect_ratios_json = VALUES(extra_aspect_ratios_json),
+                show_size_selector = VALUES(show_size_selector),
+                supports_custom_ratio = VALUES(supports_custom_ratio),
+                is_active = VALUES(is_active),
+                is_default_model = VALUES(is_default_model),
+                sort_order = VALUES(sort_order),
+                updated_at = VALUES(updated_at)
+            `,
+            [
+              row.model_id,
+              row.label,
+              row.description,
+              row.model_family,
+              row.route_family,
+              row.request_model,
+              row.selector_cost,
+              row.icon_kind,
+              row.panel_layout,
+              row.size_behavior,
+              row.default_size,
+              row.size_options_json,
+              row.extra_aspect_ratios_json,
+              row.show_size_selector ? 1 : 0,
+              row.supports_custom_ratio ? 1 : 0,
+              row.is_active ? 1 : 0,
+              row.is_default_model ? 1 : 0,
+              row.sort_order,
+              nowDb,
+              nowDb,
+            ],
+          );
         }
       });
     })();

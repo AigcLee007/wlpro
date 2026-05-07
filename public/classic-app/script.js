@@ -4,7 +4,7 @@
 const CONFIG = {
   submitUrl: "/api/generate",
   queryUrl: "/api/task/{id}",
-  model: "nano-banana-2",
+  model: "nano-banana-pro",
 };
 const CLASSIC_VIP_MODE = window.__CLASSIC_VIP_MODE__ === true;
 let refImages = [];
@@ -56,19 +56,11 @@ let classicPricingCatalog = {
       selectorCost: 5,
     },
     {
-      id: "gemini-flash",
-      label: "Nano Banana 2",
-      routeFamily: "default",
-      sizeOptions: ["1k", "2k", "4k"],
-      defaultSize: "2k",
-      selectorCost: 2.5,
-    },
-    {
       id: "gpt-image-2",
       label: "GPT-image-2",
       routeFamily: "gpt-image-2",
-      sizeOptions: ["auto", "1k", "2k", "4k"],
-      defaultSize: "auto",
+      sizeOptions: ["1k", "2k", "4k"],
+      defaultSize: "2k",
       selectorCost: 1,
     },
   ],
@@ -88,16 +80,26 @@ let classicPricingCatalog = {
         "4k": { pointCost: 5 },
       },
     },
-    { id: "openai-image-default", label: "Default Route", modelFamily: "default", line: "default", pointCost: 12 },
     {
       id: "gpt-image-2-default",
-      label: "Default Route",
+      label: "Line 1",
       modelFamily: "gpt-image-2",
-      line: "default",
+      line: "line1",
       pointCost: 1,
       sizeOverrides: {
         "1k": { upstreamModel: "gpt-image-2-all", pointCost: 1 },
         "2k": { upstreamModel: "gpt-image-2", pointCost: 2 },
+        "4k": { upstreamModel: "gpt-image-2", pointCost: 4 },
+      },
+    },
+    {
+      id: "gpt-image-2-line2",
+      label: "Line 2",
+      modelFamily: "gpt-image-2",
+      line: "line2",
+      pointCost: 3,
+      sizeOverrides: {
+        "2k": { upstreamModel: "gpt-image-2", pointCost: 3 },
         "4k": { upstreamModel: "gpt-image-2", pointCost: 4 },
       },
     },
@@ -584,22 +586,12 @@ function renderClassicLiveTasks() {
     bindLiveActions(primaryCard, primaryTask);
     grid.appendChild(primaryCard);
 
-    const drawer = document.createElement("details");
-    drawer.className = "classic-live-info-drawer";
-    drawer.innerHTML = `
-      <summary class="classic-live-drawer-summary">
-        <span>图像信息与历史</span>
-        <b>${classicLiveTasks.length > 1 ? `${classicLiveTasks.length} 条记录` : "查看详情"}</b>
-      </summary>
-      <div class="classic-live-drawer-content">
-        <div class="classic-live-selected-info">
-          ${buildClassicLiveInfoHtml(primaryTask)}
-        </div>
-      </div>
-    `;
-    const drawerContent = drawer.querySelector(".classic-live-drawer-content");
+    const selectedInfo = document.createElement("div");
+    selectedInfo.className = "classic-live-selected-info";
+    selectedInfo.innerHTML = buildClassicLiveInfoHtml(primaryTask);
+    grid.appendChild(selectedInfo);
 
-    if (drawerContent && classicLiveTasks.length > 1) {
+    if (classicLiveTasks.length > 1) {
       const strip = document.createElement("div");
       strip.className = "classic-live-strip";
       classicLiveTasks.forEach((task) => {
@@ -640,9 +632,8 @@ function renderClassicLiveTasks() {
         });
         strip.appendChild(thumb);
       });
-      drawerContent.appendChild(strip);
+      grid.appendChild(strip);
     }
-    grid.appendChild(drawer);
     return;
   }
 
@@ -1496,7 +1487,7 @@ window.selectPill = function(pillId, element, costLabel = null) {
   if (pillId === 'modelPill') {
     imageModel = val;
     localStorage.setItem('nb_image_model', val);
-    selectClassicLineSilently(getLowestClassicRouteForModel(val));
+    renderClassicLineOptions(getClassicModelConfig(val));
     updateModelUI();
   } else if (pillId === 'linePill') {
     localStorage.setItem('nb_line', normalizeClassicLine(val));
@@ -1556,6 +1547,8 @@ function updateDropdownOpenState() {
 }
 
 function updateModelUI() {
+  enforceClassicBrandHeader();
+  renderClassicModelOptions();
   const modelPill = document.getElementById('modelPill');
   if (!modelPill) return;
   const items = modelPill.querySelectorAll('.dropdown-item');
@@ -1566,10 +1559,12 @@ function updateModelUI() {
       const triggerLabel = modelPill.querySelector('.trigger-label');
       const triggerVal = modelPill.querySelector('.trigger-val');
       if (triggerLabel) {
-        triggerLabel.innerText = item.querySelector('span:not(.item-cost)')?.innerText || item.innerText;
+        const model = getClassicModelConfig(imageModel);
+        triggerLabel.innerText = getClassicModelLabel(model);
       }
       if (triggerVal) {
         triggerVal.innerText = item.querySelector('.item-cost')?.innerText || "";
+        triggerVal.style.display = triggerVal.innerText ? "inline" : "none";
       }
       modelPill.setAttribute('data-selected-value', imageModel);
     } else {
@@ -1577,18 +1572,11 @@ function updateModelUI() {
     }
   });
 
-  const titleEl = document.getElementById('brandTitleText');
-  const subEl = document.getElementById('brandSubText');
-  const badge4k = document.getElementById('brandBadge4k');
-  const lineModule = document.getElementById('lineModule');
   const grokRefModeModule = document.getElementById('grokRefModeModule');
 
-  // 根据模型切换模式选择器显示逻辑，其他保持静态
-  if (lineModule) {
-    lineModule.style.display = (imageModel === 'nano-banana') ? 'flex' : 'none';
-  }
+  renderClassicLineOptions(getClassicModelConfig(imageModel));
   if (grokRefModeModule) {
-    grokRefModeModule.style.display = String(imageModel).startsWith("grok-") ? "flex" : "none";
+    grokRefModeModule.style.display = "none";
   }
 
   const ratioPill = document.getElementById('ratioPill');
@@ -1654,9 +1642,26 @@ function getClassicLineLabel(line, fallback = "") {
   return String(fallback || line || "模式").trim();
 }
 
+function getClassicModelLabel(model = {}) {
+  const id = String(model?.id || "").trim();
+  const label = String(model?.label || id || "模型").trim();
+  if (id === "nano-banana") return `🍌🍌 ${label}`;
+  if (id === "gpt-image-2") return `✨ ${label}`;
+  return label;
+}
+
+function enforceClassicBrandHeader() {
+  const titleEl = document.getElementById("brandTitleText");
+  const subEl = document.getElementById("brandSubText");
+  const badge4k = document.getElementById("brandBadge4k");
+  if (titleEl) titleEl.textContent = "武陵商厦";
+  if (subEl) subEl.textContent = "统一账户已连接，当前使用主站登录与点数";
+  if (badge4k) badge4k.textContent = "企业版";
+  document.title = "武陵商厦创作平台";
+}
+
 function getClassicModelAlias(modelId = imageModel) {
   const value = String(modelId || "").trim();
-  if (value === "nano-banana-2") return "gemini-flash";
   return value;
 }
 
@@ -1691,18 +1696,75 @@ function getClassicRoutesForModel(model) {
 function getClassicSelectedRoute(model = getClassicModelConfig()) {
   const routes = getClassicRoutesForModel(model);
   if (!routes.length) return null;
-  const selectedLine = imageModel === "nano-banana"
+  const selectedLine = routes.length > 1
     ? normalizeClassicLine(
       localStorage.getItem("nb_line") ||
       document.getElementById("linePill")?.getAttribute("data-selected-value") ||
       "1",
     )
-    : "default";
+    : normalizeClassicLine(routes[0]?.line || "default");
   return (
     routes.find((route) => normalizeClassicLine(route.line) === selectedLine) ||
     routes.find((route) => route.isDefaultRoute) ||
+    routes.find((route) => route.isDefaultNanoBananaLine) ||
     routes[0]
   );
+}
+
+function renderClassicModelOptions() {
+  const modelPill = document.getElementById("modelPill");
+  const menu = modelPill?.querySelector(".dropdown-menu");
+  if (!modelPill || !menu) return;
+
+  const models = getClassicModels();
+  if (!models.some((model) => model.id === imageModel)) {
+    imageModel = models[0]?.id || "nano-banana";
+    localStorage.setItem("nb_image_model", imageModel);
+  }
+
+  menu.innerHTML = "";
+  models.forEach((model) => {
+    const item = document.createElement("div");
+    item.className = `dropdown-item${model.id === imageModel ? " active" : ""}`;
+    item.dataset.value = model.id;
+    const costLabel = `${formatClassicPoint(model.selectorCost || 0)} 🪙`;
+    item.innerHTML = `<span>${escapeHtml(getClassicModelLabel(model))}</span> <span class="item-cost">${escapeHtml(costLabel)}</span>`;
+    item.onclick = function () {
+      selectPill("modelPill", this, costLabel);
+    };
+    menu.appendChild(item);
+  });
+}
+
+function renderClassicLineOptions(model = getClassicModelConfig()) {
+  const lineModule = document.getElementById("lineModule");
+  const linePill = document.getElementById("linePill");
+  const menu = linePill?.querySelector(".dropdown-menu");
+  if (!lineModule || !linePill || !menu) return;
+
+  const routes = getClassicRoutesForModel(model);
+  lineModule.style.display = routes.length > 1 ? "flex" : "none";
+  menu.innerHTML = "";
+
+  routes.forEach((route) => {
+    const item = document.createElement("div");
+    item.className = "dropdown-item";
+    item.dataset.value = getClassicLineDomValue(route.line);
+    item.textContent = getClassicLineLabel(route.line, route.label);
+    item.onclick = function () {
+      selectPill("linePill", this);
+    };
+    menu.appendChild(item);
+  });
+
+  if (!routes.length) return;
+  const storedLine = normalizeClassicLine(localStorage.getItem("nb_line") || "");
+  const selectedRoute =
+    routes.find((route) => normalizeClassicLine(route.line) === storedLine) ||
+    routes.find((route) => route.isDefaultRoute) ||
+    routes.find((route) => route.isDefaultNanoBananaLine) ||
+    routes[0];
+  selectClassicLineSilently(selectedRoute);
 }
 
 function getLowestClassicRouteForModel(modelId = imageModel, size = null) {
@@ -1836,13 +1898,11 @@ async function loadClassicPricingCatalog() {
     const routes = Array.isArray(routeCatalog?.routes) ? routeCatalog.routes : [];
     if (!models.length || !routes.length) return;
     classicPricingCatalog = { models, routes };
+    renderClassicModelOptions();
     renderPriceLineFilter();
     const model = getClassicModelConfig(imageModel);
-    const storedLine = normalizeClassicLine(localStorage.getItem("nb_line") || "");
-    const storedRoute = storedLine
-      ? getClassicRoutesForModel(model).find((route) => normalizeClassicLine(route.line) === storedLine)
-      : null;
-    selectClassicLineSilently(storedRoute || getLowestClassicRouteForModel(imageModel));
+    renderClassicLineOptions(model);
+    updateModelUI();
     updateCurrentPriceCard();
   } catch (error) {
     console.warn("加载点数消耗说明失败，使用本地消耗配置兜底", error);
@@ -1953,6 +2013,9 @@ function renderLowestPriceList() {
 }
 
 window.refreshClassicCatalogUi = function () {
+  enforceClassicBrandHeader();
+  renderClassicModelOptions();
+  renderClassicLineOptions(getClassicModelConfig(imageModel));
   updateCurrentPriceCard();
   renderPriceTable();
 };
@@ -2949,13 +3012,11 @@ async function runGen() {
   
   // 模型映射表
   const MODEL_MAP = {
-    'nano-banana': 'nano-banana-2',
-    'nano-banana-2': 'gemini-3.1-flash-image-preview',
-    'grok-4.2': 'grok-4.2-image',
-    'grok-4.1': 'grok-4.1-image'
+    'nano-banana': 'nano-banana-pro',
+    'gpt-image-2': 'gpt-image-2'
   };
 
-  selectedModel = MODEL_MAP[imageModel] || 'nano-banana-2';
+  selectedModel = MODEL_MAP[imageModel] || 'nano-banana-pro';
   const isGrokModel = String(selectedModel).startsWith("grok-");
   const expectedRenderCount = isGrokModel ? 2 : batchSize;
 
@@ -3004,11 +3065,6 @@ async function runGen() {
     }
   }
 
-  // 针对 NB Pro (nano-banana-2) 处理画质后缀
-  if (selectedModel === 'nano-banana-2') {
-    if (size === "2K") selectedModel = "nano-banana-2-2k";
-    else if (size === "4K") selectedModel = "nano-banana-2-4k";
-  }
   const basePayload = {
     model: selectedModel, // 这里使用动态选择的模型，不再使用 CONFIG.model
     uiMode: "classic",
@@ -3066,7 +3122,6 @@ async function runGen() {
   }
 
   // 读取模式选择
-  const line = (imageModel === 'nano-banana') ? (document.getElementById('linePill')?.getAttribute('data-selected-value') || '1') : '1';
   const classicModelConfig = getClassicModelConfig(imageModel);
   const classicRoute = getClassicSelectedRoute(classicModelConfig);
   if (classicModelConfig?.id) {
@@ -3076,6 +3131,15 @@ async function runGen() {
     basePayload.routeId = classicRoute.id;
   }
   basePayload.imageSize = size.toLowerCase();
+  if (isClassicGptImageModel(imageModel)) {
+    const gptSettings = getClassicGptSettings();
+    basePayload.quality = gptSettings.quality;
+    basePayload.output_format = gptSettings.outputFormat;
+    basePayload.moderation = gptSettings.moderation;
+    if (gptSettings.outputCompression !== null) {
+      basePayload.output_compression = gptSettings.outputCompression;
+    }
+  }
 
   // Grok：单次请求，前端双占位，轮询后映射到2张图
   if (isGrokModel) {
@@ -3089,21 +3153,10 @@ async function runGen() {
     return;
   }
 
-  // 非 Grok：保持原逻辑
+  // 非 Grok：统一走 /api/generate。同步慢线路由服务端创建本地任务并后台执行，前端只轮询 /api/task/:taskId。
   for (let i = 0; i < batchSize; i++) {
     setTimeout(() => {
-      if (line === '2' && imageModel === 'nano-banana') {
-        const targetModel = 'gemini-3-pro-image-preview';
-        submitGeminiTask(basePayload, key, size, i + 1, targetModel, runToken);
-      } else if (line === '3' && imageModel === 'nano-banana') {
-        let line3Model = 'gemini-3.1-flash-image-preview';
-        if (size === "2K") line3Model = 'gemini-3.1-flash-image-preview-2k';
-        else if (size === "4K") line3Model = 'gemini-3.1-flash-image-preview-4k';
-        const line3Payload = { ...basePayload, model: line3Model };
-        submitSingleTask(line3Payload, key, size, i + 1, { runToken, trackUi: true });
-      } else {
-        submitSingleTask(basePayload, key, size, i + 1, { runToken, trackUi: true });
-      }
+      submitSingleTask(basePayload, key, size, i + 1, { runToken, trackUi: true });
     }, i * 200);
   }
 }
@@ -3113,72 +3166,6 @@ function updateStatus(msg) {
   if (statusText) {
     statusText.innerText = msg;
     statusText.style.color = "#FF3B30"; // 失败时显示红色
-  }
-}
-
-async function submitGeminiTask(basePayload, key, size, index, targetModel, runToken = 0) {
-  try {
-    const ratioVal = document.getElementById('ratioPill')?.getAttribute('data-selected-value') || '16:9';
-    const parts = [{ text: basePayload.prompt }];
-    if (basePayload.image && Array.isArray(basePayload.image)) {
-      basePayload.image.forEach(imgData => {
-        parts.push({
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: imgData
-          }
-        });
-      });
-    }
-
-    const payload = {
-      uiMode: "classic",
-      model: targetModel, // 显式传入目标模型
-      contents: [{ parts: parts }],
-      generationConfig: {
-        imageConfig: {
-          imageSize: size, // 1K, 2K, 4K
-          aspectRatio: ratioVal === "auto" ? smartRatio : ratioVal.split(' ')[0]
-        }
-      }
-    };
-
-    const res = await fetch('/api/gemini-generate', {
-      method: "POST",
-      headers: buildClassicRequestHeaders(key),
-      body: JSON.stringify(payload),
-    });
-
-    let data;
-    const contentType = res.headers.get("content-type");
-    if (contentType && contentType.includes("application/json")) {
-      data = await res.json();
-    } else {
-      const text = await res.text();
-      throw new Error(text.substring(0, 100) || "服务器未返回有效 JSON 响应");
-    }
-
-    if (!res.ok) throw new Error(data.error?.message || "Gemini 接口请求失败");
-
-    // 响应处理: 提取同步 Base64
-    const base64Data = data.candidates[0].content.parts[0].inlineData.data;
-    const imgUrl = `data:image/jpeg;base64,${base64Data}`;
-    
-    // 将同步返回的图片直接追加到结果区
-    if (canUpdateMainUi(runToken, true)) {
-      appendImageToGrid(imgUrl, size, null, { runToken, trackUi: true });
-    } else {
-      saveToHistory(imgUrl, document.getElementById("prompt")?.value?.trim() || "");
-    }
-    
-  } catch (error) {
-    console.error(`Gemini Task ${index} Failed:`, error);
-    if (canUpdateMainUi(runToken, true)) {
-      updateStatus(`稳定模式任务 ${index} 失败: ` + error.message);
-      activeTasksCount--;
-      completedTasksCount++;
-      checkAllDone(size);
-    }
   }
 }
 

@@ -1848,8 +1848,8 @@ html.classic-vip-mode .classic-live-empty {
 
 .classic-live-card.is-primary .classic-live-media {
   flex: 0 0 auto;
-  height: clamp(430px, calc(100vh - 310px), 690px);
-  min-height: 430px;
+  height: clamp(300px, calc(100vh - 520px), 480px);
+  min-height: 300px;
 }
 
 .classic-live-media img {
@@ -1970,67 +1970,9 @@ html.classic-vip-mode .classic-live-empty {
 .classic-live-info-drawer {
   display: block;
   flex: 0 0 auto;
-  border-radius: 14px;
-  border: 1px solid rgba(255, 214, 10, 0.16);
-  background:
-    linear-gradient(135deg, rgba(255, 214, 10, 0.055), rgba(77, 190, 255, 0.03)),
-    rgba(7, 10, 16, 0.82);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
-  overflow: hidden;
-}
-
-.classic-live-drawer-summary {
-  min-height: 44px;
-  padding: 0 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: rgba(245, 247, 255, 0.9);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.classic-live-drawer-summary::-webkit-details-marker {
-  display: none;
-}
-
-.classic-live-drawer-summary span {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--banana);
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.classic-live-drawer-summary span::before {
-  content: "＋";
-  display: inline-grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
-  color: #05070b;
-  background: var(--banana);
-  box-shadow: 0 0 14px rgba(255, 214, 10, 0.28);
-}
-
-.classic-live-info-drawer[open] .classic-live-drawer-summary span::before {
-  content: "－";
-}
-
-.classic-live-drawer-summary b {
-  color: rgba(180, 190, 205, 0.82);
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.classic-live-drawer-content {
-  display: grid;
-  gap: 12px;
-  padding: 0 12px 12px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(135deg, rgba(0, 0, 0, 0.26), rgba(255, 255, 255, 0.025));
 }
 
 .classic-live-selected-info {
@@ -2038,8 +1980,11 @@ html.classic-vip-mode .classic-live-empty {
   display: block;
   padding: 12px 14px 14px;
   border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 214, 10, 0.16);
+  background:
+    linear-gradient(135deg, rgba(255, 214, 10, 0.06), rgba(77, 190, 255, 0.035)),
+    rgba(7, 10, 16, 0.82);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
 }
 
 .classic-live-info-head {
@@ -5258,8 +5203,8 @@ html.classic-vip-mode .classic-live-empty {
   }
 
   .classic-live-card.is-primary .classic-live-media {
-    height: clamp(430px, calc(100vh - 310px), 690px);
-    min-height: 430px;
+    height: clamp(300px, calc(100vh - 520px), 480px);
+    min-height: 300px;
   }
 }
 
