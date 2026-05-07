@@ -584,12 +584,22 @@ function renderClassicLiveTasks() {
     bindLiveActions(primaryCard, primaryTask);
     grid.appendChild(primaryCard);
 
-    const selectedInfo = document.createElement("div");
-    selectedInfo.className = "classic-live-selected-info";
-    selectedInfo.innerHTML = buildClassicLiveInfoHtml(primaryTask);
-    grid.appendChild(selectedInfo);
+    const drawer = document.createElement("details");
+    drawer.className = "classic-live-info-drawer";
+    drawer.innerHTML = `
+      <summary class="classic-live-drawer-summary">
+        <span>图像信息与历史</span>
+        <b>${classicLiveTasks.length > 1 ? `${classicLiveTasks.length} 条记录` : "查看详情"}</b>
+      </summary>
+      <div class="classic-live-drawer-content">
+        <div class="classic-live-selected-info">
+          ${buildClassicLiveInfoHtml(primaryTask)}
+        </div>
+      </div>
+    `;
+    const drawerContent = drawer.querySelector(".classic-live-drawer-content");
 
-    if (classicLiveTasks.length > 1) {
+    if (drawerContent && classicLiveTasks.length > 1) {
       const strip = document.createElement("div");
       strip.className = "classic-live-strip";
       classicLiveTasks.forEach((task) => {
@@ -630,8 +640,9 @@ function renderClassicLiveTasks() {
         });
         strip.appendChild(thumb);
       });
-      grid.appendChild(strip);
+      drawerContent.appendChild(strip);
     }
+    grid.appendChild(drawer);
     return;
   }
 
