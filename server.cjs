@@ -349,6 +349,15 @@ const fetchVisionaryRecordById = async ({
 };
 const LOCAL_IMAGE_JOBS = new Map();
 const LOCAL_IMAGE_JOB_TTL_MS = 30 * 60 * 1000;
+const BACKGROUND_SYNC_IMAGE_ROUTE_IDS = new Set(
+  String(
+    process.env.BACKGROUND_SYNC_IMAGE_ROUTE_IDS ||
+      "gpt-image-2-line2,nano-banana-pro-line3",
+  )
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean),
+);
 const createLocalImageJobId = () =>
   `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const setLocalImageJob = (jobId, patch) => {
@@ -368,6 +377,9 @@ const scheduleLocalImageJobCleanup = (jobId) => {
     LOCAL_IMAGE_JOBS.delete(jobId);
   }, LOCAL_IMAGE_JOB_TTL_MS).unref?.();
 };
+const shouldRunSyncImageRouteInBackground = (route) =>
+  String(route?.mode || "").trim().toLowerCase() === "sync" &&
+  BACKGROUND_SYNC_IMAGE_ROUTE_IDS.has(String(route?.id || "").trim());
 const toImmediateImagePayload = (payload) => {
   const resultUrls = extractResultUrlsFromPayload(payload);
   return {
@@ -3259,11 +3271,14 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
 
     if (isGeminiNativeRoute(route)) {
       const isAsyncGeminiRoute = routeMode === "async";
+      const shouldBackgroundGeminiRoute =
+        isAsyncGeminiRoute || shouldRunSyncImageRouteInBackground(route);
+      const geminiExecutionMode = isAsyncGeminiRoute ? "async" : "background_sync";
       if (shouldUseBilling) {
         billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
           action: "generate",
           routeId: route.id,
-          mode: isAsyncGeminiRoute ? "async" : route.mode,
+          mode: shouldBackgroundGeminiRoute ? geminiExecutionMode : route.mode,
           model: requestBody.model,
           modelId: requestedImageModel?.id || null,
         });
@@ -3285,11 +3300,11 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
         status: "PENDING",
         meta: {
           transport: route.transport,
-          routeMode: isAsyncGeminiRoute ? "async" : route.mode,
+          routeMode: shouldBackgroundGeminiRoute ? geminiExecutionMode : route.mode,
         },
       });
 
-      if (isAsyncGeminiRoute) {
+      if (shouldBackgroundGeminiRoute) {
         const localJobId = createLocalImageJobId();
         localTaskId = buildImageTaskToken(route.id, localJobId);
         setLocalImageJob(localJobId, {
@@ -3360,7 +3375,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
               aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
               meta: mergeGeneratedAssetMeta({
                 transport: route.transport,
-                routeMode: "async",
+                routeMode: geminiExecutionMode,
                 settled: "gemini_native_background_job",
               }, persistedResult),
             });
@@ -3401,7 +3416,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
               aspectRatio: requestBody.aspect_ratio || requestBody.aspectRatio || null,
               meta: {
                 transport: route.transport,
-                routeMode: "async",
+                routeMode: geminiExecutionMode,
                 upstreamStatus: error.response?.status || null,
                 upstreamError: error.response?.data || null,
                 upstreamContext: error.geminiNative || null,
@@ -3758,7 +3773,12 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
       },
     });
 
-    if (isVisionaryImageRoute(route) && isSyncLine && !shouldUseChatSyncEndpoint) {
+    const shouldBackgroundOpenAiSyncRoute =
+      isSyncLine &&
+      !shouldUseChatSyncEndpoint &&
+      (isVisionaryImageRoute(route) || shouldRunSyncImageRouteInBackground(route));
+
+    if (shouldBackgroundOpenAiSyncRoute) {
       const localJobId = createLocalImageJobId();
       localTaskId = buildImageTaskToken(route.id, localJobId);
       setLocalImageJob(localJobId, {
@@ -3835,16 +3855,19 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
                 });
                 if (["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(settledStatus)) break;
                 if (["FAILED", "FAILURE", "ERROR", "CANCELLED", "CANCELED"].includes(settledStatus)) {
-                  throw new Error(record.error || record.failure_reason || "Visionary generation failed");
+                  throw new Error(record.error || record.failure_reason || "Image generation failed");
                 }
               }
               await sleep(2000);
             }
           }
 
-          if (resultUrls.length === 0 || !["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(settledStatus)) {
+          const isSettledSuccess =
+            ["SUCCEEDED", "SUCCESS", "COMPLETED"].includes(settledStatus) ||
+            isImmediateImageResultPayload(settledPayload, resultUrls);
+          if (resultUrls.length === 0 || !isSettledSuccess) {
             throw new Error(
-              `Visionary generation did not return an image URL (status: ${settledStatus || "UNKNOWN"})`,
+              `Image generation did not return an image URL (status: ${settledStatus || "UNKNOWN"})`,
             );
           }
 
@@ -3887,9 +3910,9 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
             aspectRatio: requestBody.aspect_ratio || null,
             meta: mergeGeneratedAssetMeta({
               transport: route.transport,
-              routeMode: "sync",
+              routeMode: "background_sync",
               upstreamStatus: settledStatus,
-              settled: "visionary_background_job",
+              settled: "sync_background_job",
             }, persistedResult),
           });
         } catch (error) {
@@ -3923,7 +3946,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
           });
           logger.error({
             timestamp: new Date().toISOString(),
-            type: "Visionary Background Generate Error",
+            type: "Sync Background Generate Error",
             message: normalizedError.error,
             stack: error.stack,
             response: error.response?.data,
@@ -4433,11 +4456,152 @@ app.post("/api/edit", generateLimiter, async (req, res) => {
       billingCharge = await reservePoints(billingAccount.accountId, pointCost, {
         action: "edit",
         routeId: route.id,
-        mode: route.mode,
+        mode: shouldRunSyncImageRouteInBackground(route) ? "background_sync" : route.mode,
         model: requestBody.model,
         modelId: requestedImageModel?.id || null,
       });
     }
+
+    if (shouldRunSyncImageRouteInBackground(route)) {
+      const localJobId = createLocalImageJobId();
+      localTaskId = buildImageTaskToken(route.id, localJobId);
+      setLocalImageJob(localJobId, {
+        localTaskId,
+        routeId: route.id,
+        status: "processing",
+        progress: 0,
+        results: [],
+      });
+      scheduleLocalImageJobCleanup(localJobId);
+
+      if (shouldUseBilling) {
+        await registerPendingTask(localTaskId, {
+          accountId: billingAccount.accountId,
+          chargeId: billingCharge?.chargeId || null,
+          points: pointCost,
+          routeId: route.id,
+          action: "edit",
+        });
+      }
+
+      (async () => {
+        try {
+          const response = await requestWithRetry(
+            () =>
+              axios.post(
+                buildRouteUrl(route, route.editPath || "/v1/images/edits"),
+                formData,
+                {
+                  headers: {
+                    Authorization: authorization,
+                    ...formData.getHeaders(),
+                  },
+                  timeout: 600000,
+                  httpsAgent: SHARED_HTTPS_AGENT,
+                },
+              ),
+            { retries: 1, delayMs: 700, label: `edit-bg-${route.id}` },
+          );
+          const resultUrls = extractResultUrlsFromPayload(response.data);
+          const taskStatus = extractResultStatus(response.data);
+          const isSettledSuccess =
+            isTaskSuccessStatus(taskStatus) ||
+            isImmediateImageResultPayload(response.data, resultUrls);
+          if (resultUrls.length === 0 || !isSettledSuccess) {
+            if (isTaskFailureStatus(taskStatus)) {
+              throw new Error(
+                response.data?.error ||
+                  response.data?.message ||
+                  response.data?.fail_reason ||
+                  "Image edit failed",
+              );
+            }
+            throw new Error(
+              `Image edit did not return an image URL (status: ${taskStatus || "UNKNOWN"})`,
+            );
+          }
+
+          let successPayload = {
+            ...toImmediateImagePayload(response.data),
+            id: localTaskId,
+            task_id: localTaskId,
+            status: "succeeded",
+          };
+          const persistedResult = await persistImageResultPayloadSafe({
+            payload: successPayload,
+            resultUrls,
+            req,
+            billingAccount,
+            route,
+            modelId: requestedImageModel?.id || null,
+            taskId: localTaskId,
+          });
+          successPayload = {
+            ...persistedResult.payload,
+            id: localTaskId,
+            task_id: localTaskId,
+            status: "succeeded",
+          };
+          setLocalImageJob(localJobId, {
+            status: "succeeded",
+            progress: 100,
+            responseData: successPayload,
+          });
+          await settlePendingTask(localTaskId, "SUCCESS");
+        } catch (error) {
+          const normalizedError = normalizeGenerationError(error);
+          setLocalImageJob(localJobId, {
+            status: "failed",
+            progress: 100,
+            responseData: {
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "failed",
+              error: normalizedError.error,
+              code: normalizedError.code || undefined,
+              statusCode: normalizedError.status,
+              traceId: normalizedError.traceId || undefined,
+              details: normalizedError.details || undefined,
+              failure_reason: normalizedError.error,
+              upstream_status: error.response?.status || null,
+              upstream_error: error.response?.data || null,
+              results: [],
+            },
+          });
+          await settlePendingTask(localTaskId, "FAILED");
+          logger.error({
+            timestamp: new Date().toISOString(),
+            type: "Sync Background Edit Error",
+            message: normalizedError.error,
+            stack: error.stack,
+            response: error.response?.data,
+          });
+        }
+      })();
+
+      return res.json(
+        shouldUseBilling
+          ? {
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "processing",
+              progress: 0,
+              results: [],
+              billing: {
+                deductedPoints: pointCost,
+                remainingPoints: billingCharge?.account?.points,
+              },
+            }
+          : {
+              id: localTaskId,
+              task_id: localTaskId,
+              status: "processing",
+              progress: 0,
+              results: [],
+            },
+      );
+    }
+
     const response = await requestWithRetry(
       () =>
         axios.post(
