@@ -54,10 +54,16 @@ const PENDING_RETENTION_DAYS = Math.max(
   1,
   parseEnvInt(process.env.GENERATION_RECORD_PENDING_RETENTION_DAYS, 5),
 );
+const STALE_PENDING_MINUTES = Math.max(
+  30,
+  parseEnvInt(process.env.GENERATION_RECORD_PENDING_STALE_MINUTES, 120),
+);
 const CLEANUP_INTERVAL_MS = Math.max(
   60 * 60 * 1000,
   parseEnvInt(process.env.GENERATION_RECORD_CLEANUP_INTERVAL_MS, 6 * 60 * 60 * 1000),
 );
+const STALE_PENDING_MESSAGE =
+  "任务长时间未完成，已自动结束。若图片已生成但未进入历史，通常是服务重启或本地后台任务过期导致结果无法恢复，请重新提交。";
 
 const LIST_COLUMNS = `
   id, user_id, account_id, owner_email, ui_mode, media_type, action_name,
@@ -483,8 +489,35 @@ const getGenerationRecordByTaskId = async (taskId) => {
   return rows[0] ? publicRecord(rows[0]) : null;
 };
 
+const failStalePendingGenerationRecords = async () => {
+  await ensureGenerationRecordSchema();
+  const pool = await getPool();
+  const nowDb = toDbDateTime(new Date());
+  const safeMinutes = Math.max(30, Number.parseInt(String(STALE_PENDING_MINUTES), 10) || 120);
+  const [result] = await pool.execute(
+    `
+      UPDATE generation_records
+      SET status = CASE
+            WHEN COALESCE(NULLIF(result_urls_json, ''), '[]') <> '[]' THEN 'SUCCESS'
+            ELSE 'FAILED'
+          END,
+          error_message = CASE
+            WHEN COALESCE(NULLIF(result_urls_json, ''), '[]') <> '[]' THEN error_message
+            ELSE COALESCE(NULLIF(error_message, ''), ?)
+          END,
+          updated_at = ?,
+          completed_at = COALESCE(completed_at, ?)
+      WHERE status = 'PENDING'
+        AND created_at < UTC_TIMESTAMP(3) - INTERVAL ${safeMinutes} MINUTE
+    `,
+    [STALE_PENDING_MESSAGE, nowDb, nowDb],
+  );
+  return Number(result?.affectedRows || 0);
+};
+
 const listGenerationRecordsForUser = async (userId, options = {}) => {
   await ensureGenerationRecordSchema();
+  await failStalePendingGenerationRecords().catch(() => 0);
 
   const normalizedUserId = String(userId || "").trim();
   const mediaType = String(options.mediaType || "all").trim().toUpperCase();
@@ -616,6 +649,7 @@ const clearGenerationRecordsForUser = async (userId, options = {}) => {
 
 const cleanupExpiredGenerationRecords = async () => {
   await ensureGenerationRecordSchema();
+  await failStalePendingGenerationRecords().catch(() => 0);
   const pool = await getPool();
   const [result] = await pool.execute(
     `

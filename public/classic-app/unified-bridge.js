@@ -2013,6 +2013,7 @@
   const fetchGenerationRecords = async ({
     mediaType = "all",
     status = "all",
+    uiMode = "classic",
     page = 1,
     pageSize = HISTORY_INITIAL_PAGE_SIZE,
     sinceCreatedAt = "",
@@ -2021,6 +2022,7 @@
     const params = new URLSearchParams();
     params.set("mediaType", String(mediaType || "all"));
     params.set("status", String(status || "all"));
+    params.set("uiMode", String(uiMode || "classic"));
     params.set("page", String(page || 1));
     params.set("pageSize", String(pageSize || HISTORY_INITIAL_PAGE_SIZE));
     if (sinceCreatedAt) params.set("sinceCreatedAt", String(sinceCreatedAt));
@@ -2032,14 +2034,17 @@
       },
     });
   };
-  const deleteGenerationRecords = async ({ mediaType = "all" } = {}) =>
-    fetchJson(`/generation-records?mediaType=${encodeURIComponent(mediaType)}`, {
+  const deleteGenerationRecords = async ({ mediaType = "all", uiMode = "classic" } = {}) =>
+    fetchJson(
+      `/generation-records?mediaType=${encodeURIComponent(mediaType)}&uiMode=${encodeURIComponent(uiMode)}`,
+      {
       method: "DELETE",
       headers: {
         "Content-Type": "application/json",
         ...buildSessionHeaders(),
       },
-    });
+      },
+    );
   const dedupeHistoryRecords = (records = []) => {
     const seen = new Set();
     const ordered = [];

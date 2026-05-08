@@ -9,6 +9,12 @@ const RECORD_RETENTION_DAYS = Math.max(
   1,
   Number.parseInt(String(process.env.GENERATION_RECORD_SUCCESS_RETENTION_DAYS || "5"), 10) || 5,
 );
+const STALE_PENDING_MINUTES = Math.max(
+  30,
+  Number.parseInt(String(process.env.GENERATION_RECORD_PENDING_STALE_MINUTES || "120"), 10) || 120,
+);
+const STALE_PENDING_MESSAGE =
+  "任务长时间未完成，已自动结束。若图片已生成但未进入历史，通常是服务重启或本地后台任务过期导致结果无法恢复，请重新提交。";
 
 const createDefaultStore = () => ({
   version: GENERATION_RECORD_VERSION,
@@ -62,6 +68,7 @@ const withStore = (mutator) => {
 };
 
 const cleanupStore = (store) => {
+  failStalePendingRecordsInStore(store);
   const cutoff = Date.now() - RECORD_RETENTION_DAYS * 24 * 60 * 60 * 1000;
   store.records = store.records.filter((record) => {
     const timestamp = new Date(record.createdAt || record.updatedAt || 0).getTime();
@@ -75,6 +82,25 @@ const cleanupStore = (store) => {
   if (store.records.length > RECORD_LIMIT) {
     store.records = store.records.slice(0, RECORD_LIMIT);
   }
+};
+
+const failStalePendingRecordsInStore = (store) => {
+  const cutoff = Date.now() - STALE_PENDING_MINUTES * 60 * 1000;
+  const now = new Date().toISOString();
+  store.records.forEach((record) => {
+    if (normalizeStatus(record.status) !== "PENDING") return;
+    const timestamp = new Date(record.createdAt || record.updatedAt || 0).getTime();
+    if (!Number.isFinite(timestamp) || timestamp >= cutoff) return;
+    if (Array.isArray(record.resultUrls) && record.resultUrls.length > 0) {
+      record.status = "SUCCESS";
+      record.previewUrl = record.previewUrl || record.resultUrls[0] || null;
+    } else {
+      record.status = "FAILED";
+      record.errorMessage = record.errorMessage || STALE_PENDING_MESSAGE;
+    }
+    record.updatedAt = now;
+    record.completedAt = record.completedAt || now;
+  });
 };
 
 const normalizeStatus = (value = "PENDING") => {
