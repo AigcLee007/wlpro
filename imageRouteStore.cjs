@@ -285,116 +285,13 @@ const ensureImageRouteSchema = async () => {
           MODIFY COLUMN point_cost DECIMAL(10,1) NOT NULL DEFAULT 0
         `);
       }
-      await pool.execute(
-        `
-          UPDATE image_routes
-          SET allow_user_api_key_without_login = 1
-          WHERE transport = 'openai-image'
-            AND mode = 'async'
-            AND LOWER(base_url) LIKE '%api.bltcy.ai%'
-        `,
-      );
-      const nowDb = toDbDateTime();
-      const line1StaticRoute = getStaticRouteDefaults("gpt-image-2-default");
-      if (line1StaticRoute) {
-        await pool.execute(
-          `
-            UPDATE image_routes
-            SET label = ?,
-                description = ?,
-                line_value = ?,
-                point_cost = ?,
-                size_overrides = ?,
-                sort_order = ?,
-                is_active = 1,
-                is_default_route = 0,
-                updated_at = ?
-            WHERE route_id = ?
-          `,
-          [
-            line1StaticRoute.label,
-            line1StaticRoute.description,
-            line1StaticRoute.line_value,
-            line1StaticRoute.point_cost,
-            line1StaticRoute.size_overrides,
-            line1StaticRoute.sort_order,
-            nowDb,
-            line1StaticRoute.route_id,
-          ],
-        );
-      }
-      const line2StaticRoute = getStaticRouteDefaults("gpt-image-2-line2");
-      if (line2StaticRoute) {
-        await pool.execute(
-          `
-            UPDATE image_routes
-            SET label = ?,
-                description = ?,
-                line_value = ?,
-                transport = ?,
-                mode = ?,
-                base_url = ?,
-                generate_path = ?,
-                task_path = ?,
-                edit_path = ?,
-                use_request_model = ?,
-                allow_user_api_key_without_login = ?,
-                api_key_env = ?,
-                point_cost = ?,
-                size_overrides = ?,
-                sort_order = ?,
-                is_active = 1,
-                is_default_route = 0,
-                updated_at = ?
-            WHERE route_id = ?
-          `,
-          [
-            line2StaticRoute.label,
-            line2StaticRoute.description,
-            line2StaticRoute.line_value,
-            line2StaticRoute.transport,
-            line2StaticRoute.mode,
-            line2StaticRoute.base_url,
-            line2StaticRoute.generate_path,
-            line2StaticRoute.task_path,
-            line2StaticRoute.edit_path,
-            line2StaticRoute.use_request_model ? 1 : 0,
-            line2StaticRoute.allow_user_api_key_without_login ? 1 : 0,
-            line2StaticRoute.api_key_env,
-            line2StaticRoute.point_cost,
-            line2StaticRoute.size_overrides,
-            line2StaticRoute.sort_order,
-            nowDb,
-            line2StaticRoute.route_id,
-          ],
-        );
-      }
-      await pool.execute(
-        `
-          UPDATE image_routes
-          SET is_active = 0,
-              is_default_route = 0,
-              updated_at = ?
-          WHERE model_family = 'gpt-image-2'
-            AND route_id NOT IN ('gpt-image-2-default', 'gpt-image-2-line2')
-        `,
-        [nowDb],
-      );
-
       await withTransaction(async (connection) => {
-        const routeIds = getStaticRouteIds();
-        if (routeIds.length > 0) {
-          await connection.execute(
-            `DELETE FROM image_routes WHERE route_id NOT IN (${routeIds.map(() => "?").join(", ")})`,
-            routeIds,
-          );
-        }
-
+        const nowDb = toDbDateTime();
         const rows = buildStaticRows();
         for (const row of rows) {
           await connection.execute(
             `
-              INSERT INTO image_routes (
+              INSERT IGNORE INTO image_routes (
                 route_id, label, description, model_family, line_value,
                 transport, mode, base_url, generate_path, task_path,
                 edit_path, chat_path, upstream_model, use_request_model,
@@ -402,29 +299,6 @@ const ensureImageRouteSchema = async () => {
                 api_key, api_key_env, point_cost, size_overrides, sort_order, is_active,
                 is_default_route, is_default_nano_banana_line, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON DUPLICATE KEY UPDATE
-                label = VALUES(label),
-                description = VALUES(description),
-                model_family = VALUES(model_family),
-                line_value = VALUES(line_value),
-                transport = VALUES(transport),
-                mode = VALUES(mode),
-                base_url = VALUES(base_url),
-                generate_path = VALUES(generate_path),
-                task_path = VALUES(task_path),
-                edit_path = VALUES(edit_path),
-                chat_path = VALUES(chat_path),
-                upstream_model = VALUES(upstream_model),
-                use_request_model = VALUES(use_request_model),
-                allow_user_api_key_without_login = VALUES(allow_user_api_key_without_login),
-                api_key_env = VALUES(api_key_env),
-                point_cost = VALUES(point_cost),
-                size_overrides = VALUES(size_overrides),
-                sort_order = VALUES(sort_order),
-                is_active = VALUES(is_active),
-                is_default_route = VALUES(is_default_route),
-                is_default_nano_banana_line = VALUES(is_default_nano_banana_line),
-                updated_at = VALUES(updated_at)
             `,
             [
               row.route_id,

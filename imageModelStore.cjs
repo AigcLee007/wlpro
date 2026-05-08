@@ -239,66 +239,20 @@ const ensureImageModelSchema = async () => {
         `);
       }
 
-      const gptImage2StaticModel = getStaticModelDefaults("gpt-image-2");
-      if (gptImage2StaticModel) {
-        await pool.execute(
-          `
-            UPDATE image_models
-            SET default_size = ?,
-                size_options_json = ?,
-                updated_at = ?
-            WHERE model_id = ?
-          `,
-          [
-            gptImage2StaticModel.default_size,
-            gptImage2StaticModel.size_options_json,
-            toDbDateTime(),
-            gptImage2StaticModel.model_id,
-          ],
-        );
-      }
-
       await withTransaction(async (connection) => {
         const nowDb = toDbDateTime();
         const rows = buildStaticRows();
 
-        const staticModelIds = getStaticModelIds();
-        if (staticModelIds.length > 0) {
-          await connection.execute(
-            `DELETE FROM image_models WHERE model_id NOT IN (${staticModelIds.map(() => "?").join(", ")})`,
-            staticModelIds,
-          );
-        }
-
         for (const row of rows) {
           await connection.execute(
             `
-              INSERT INTO image_models (
+              INSERT IGNORE INTO image_models (
                 model_id, label, description, model_family, route_family,
                 request_model, selector_cost, icon_kind, panel_layout, size_behavior,
                 default_size, size_options_json, extra_aspect_ratios_json,
                 show_size_selector, supports_custom_ratio, is_active,
                 is_default_model, sort_order, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON DUPLICATE KEY UPDATE
-                label = VALUES(label),
-                description = VALUES(description),
-                model_family = VALUES(model_family),
-                route_family = VALUES(route_family),
-                request_model = VALUES(request_model),
-                selector_cost = VALUES(selector_cost),
-                icon_kind = VALUES(icon_kind),
-                panel_layout = VALUES(panel_layout),
-                size_behavior = VALUES(size_behavior),
-                default_size = VALUES(default_size),
-                size_options_json = VALUES(size_options_json),
-                extra_aspect_ratios_json = VALUES(extra_aspect_ratios_json),
-                show_size_selector = VALUES(show_size_selector),
-                supports_custom_ratio = VALUES(supports_custom_ratio),
-                is_active = VALUES(is_active),
-                is_default_model = VALUES(is_default_model),
-                sort_order = VALUES(sort_order),
-                updated_at = VALUES(updated_at)
             `,
             [
               row.model_id,
