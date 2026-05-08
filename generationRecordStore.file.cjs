@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { randomBytes } = require("crypto");
+const { settlePendingTask } = require("./billingStore.cjs");
 
 const GENERATION_RECORD_FILE = path.join(__dirname, "generation-records.json");
 const GENERATION_RECORD_VERSION = 1;
@@ -15,6 +16,7 @@ const STALE_PENDING_MINUTES = Math.max(
 );
 const STALE_PENDING_MESSAGE =
   "任务长时间未完成，已自动结束。若图片已生成但未进入历史，通常是服务重启或本地后台任务过期导致结果无法恢复，请重新提交。";
+const STALE_PENDING_BILLING_STATUS = "EXPIRED_CHARGED";
 
 const createDefaultStore = () => ({
   version: GENERATION_RECORD_VERSION,
@@ -87,6 +89,7 @@ const cleanupStore = (store) => {
 const failStalePendingRecordsInStore = (store) => {
   const cutoff = Date.now() - STALE_PENDING_MINUTES * 60 * 1000;
   const now = new Date().toISOString();
+  const staleTaskIds = [];
   store.records.forEach((record) => {
     if (normalizeStatus(record.status) !== "PENDING") return;
     const timestamp = new Date(record.createdAt || record.updatedAt || 0).getTime();
@@ -100,6 +103,10 @@ const failStalePendingRecordsInStore = (store) => {
     }
     record.updatedAt = now;
     record.completedAt = record.completedAt || now;
+    if (record.taskId) staleTaskIds.push(String(record.taskId));
+  });
+  staleTaskIds.forEach((taskId) => {
+    Promise.resolve(settlePendingTask(taskId, STALE_PENDING_BILLING_STATUS)).catch(() => null);
   });
 };
 

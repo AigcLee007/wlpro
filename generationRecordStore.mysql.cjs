@@ -1,4 +1,5 @@
 const { randomBytes } = require("crypto");
+const { settlePendingTask } = require("./billingStore.cjs");
 const {
   fromDbDateTime,
   getPool,
@@ -64,6 +65,7 @@ const CLEANUP_INTERVAL_MS = Math.max(
 );
 const STALE_PENDING_MESSAGE =
   "任务长时间未完成，已自动结束。若图片已生成但未进入历史，通常是服务重启或本地后台任务过期导致结果无法恢复，请重新提交。";
+const STALE_PENDING_BILLING_STATUS = "EXPIRED_CHARGED";
 
 const LIST_COLUMNS = `
   id, user_id, account_id, owner_email, ui_mode, media_type, action_name,
@@ -494,6 +496,17 @@ const failStalePendingGenerationRecords = async () => {
   const pool = await getPool();
   const nowDb = toDbDateTime(new Date());
   const safeMinutes = Math.max(30, Number.parseInt(String(STALE_PENDING_MINUTES), 10) || 120);
+  const [staleRows] = await pool.execute(
+    `
+      SELECT task_id
+      FROM generation_records
+      WHERE status = 'PENDING'
+        AND task_id IS NOT NULL
+        AND task_id <> ''
+        AND created_at < UTC_TIMESTAMP(3) - INTERVAL ${safeMinutes} MINUTE
+      LIMIT 500
+    `,
+  );
   const [result] = await pool.execute(
     `
       UPDATE generation_records
@@ -512,6 +525,11 @@ const failStalePendingGenerationRecords = async () => {
     `,
     [STALE_PENDING_MESSAGE, nowDb, nowDb],
   );
+  for (const row of staleRows || []) {
+    const taskId = String(row?.task_id || "").trim();
+    if (!taskId) continue;
+    await settlePendingTask(taskId, STALE_PENDING_BILLING_STATUS).catch(() => null);
+  }
   return Number(result?.affectedRows || 0);
 };
 
