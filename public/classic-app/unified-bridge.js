@@ -1200,27 +1200,21 @@
     }
   };
   const updateBrandHeader = () => {
-    const currentModel = getCurrentModel();
     const titleEl = document.getElementById("brandTitleText");
     const subEl = document.getElementById("brandSubText");
     const badgeEl = document.getElementById("brandBadge4k");
 
     if (titleEl) {
-      titleEl.textContent = currentModel?.label || "Classic Create";
+      titleEl.textContent = "武陵商厦";
     }
     if (subEl) {
-      if (isSessionAuthenticated()) {
-        subEl.textContent = "统一账户已连接，当前使用主站登录与点数";
-      } else if (getStoredApiKey()) {
-        subEl.textContent = "旧 Key 兼容模式已启用，可直连兼容线路";
-      } else {
-        subEl.textContent = "登录后可使用全部模型；旧 API Key 兼容部分线路";
-      }
+      subEl.textContent = "统一账户已连接，当前使用主站登录与点数";
     }
     if (badgeEl) {
-      const supports4k = (currentModel?.sizeOptions || []).includes("4k");
-      badgeEl.style.display = supports4k ? "inline-flex" : "none";
+      badgeEl.textContent = "企业版";
+      badgeEl.style.display = "inline-flex";
     }
+    document.title = "武陵商厦创作平台";
   };
   const updateLegacyAdminVisibility = () => {
     const adminSection = document.getElementById("adminNoticeSection");
