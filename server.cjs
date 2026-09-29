@@ -349,15 +349,16 @@ const fetchVisionaryRecordById = async ({
 };
 const LOCAL_IMAGE_JOBS = new Map();
 const LOCAL_IMAGE_JOB_TTL_MS = 30 * 60 * 1000;
-const BACKGROUND_SYNC_IMAGE_ROUTE_IDS = new Set(
-  String(
-    process.env.BACKGROUND_SYNC_IMAGE_ROUTE_IDS ||
-      "gpt-image-2-line2,nano-banana-pro-line3",
-  )
+const BACKGROUND_SYNC_IMAGE_ROUTE_IDS = new Set([
+  ...String(process.env.BACKGROUND_SYNC_IMAGE_ROUTE_IDS || "")
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean),
-);
+  "gpt-image-2-line2",
+  "gpt-image-2.5-sunburst-line2",
+  "gpt-image-2.5-sunburst-line3",
+  "nano-banana-pro-line3",
+]);
 const createLocalImageJobId = () =>
   `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const setLocalImageJob = (jobId, patch) => {
@@ -3110,7 +3111,11 @@ const GPT_IMAGE2_MAX_EDGE = 3840;
 const GPT_IMAGE2_MAX_ASPECT_RATIO = 3;
 const GPT_IMAGE2_MIN_PIXELS = 655360;
 const GPT_IMAGE2_MAX_PIXELS = 8294400;
-const GPT_IMAGE2_REQUEST_MODELS = new Set(["gpt-image-2", "gpt-image-2-all"]);
+const GPT_IMAGE2_REQUEST_MODELS = new Set([
+  "gpt-image-2",
+  "gpt-image-2-all",
+  "gpt-image-2.5-sunburst",
+]);
 
 const isGptImage2RequestModel = (model = "") =>
   GPT_IMAGE2_REQUEST_MODELS.has(String(model || "").trim());

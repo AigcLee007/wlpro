@@ -790,8 +790,10 @@
     const resolvedRequestModel = String(requestModel || model?.requestModel || "").trim();
     return (
       modelId === "gpt-image-2" ||
+      modelId === "gpt-image-2.5-sunburst" ||
       resolvedRequestModel === "gpt-image-2" ||
-      resolvedRequestModel === "gpt-image-2-all"
+      resolvedRequestModel === "gpt-image-2-all" ||
+      resolvedRequestModel === "gpt-image-2.5-sunburst"
     );
   };
   const isGeminiNativeSyncRoute = (route) =>

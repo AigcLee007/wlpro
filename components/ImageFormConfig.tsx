@@ -12,6 +12,9 @@ import {
   getImageModelOptions,
   getImageModelSizeOptions,
   getNormalizedImageSizeForModel,
+  getGptImageQualityOptions,
+  isGptImageModel,
+  normalizeGptImageQuality,
   shouldShowImageSizeSelector,
 } from '../src/config/imageModels';
 import {
@@ -113,13 +116,14 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
   const normalizedSize = getNormalizedImageSizeForModel(currentModel.id, imageSize);
   const showLineSelector = availableRoutes.length > 1;
   const showSizeSelector = shouldShowImageSizeSelector(currentModel.id);
-  const isGptImage2 = currentModel.id === 'gpt-image-2';
+  const isGptImage = isGptImageModel(currentModel.id);
   const selectedRoute = useMemo(
     () =>
       availableRoutes.find((route) => route.line === imageLine) ||
       getSelectedImageRoute(currentModel.id, imageLine),
     [availableRoutes, currentModel.id, imageLine, loadedImageRoutes],
   );
+  const gptQualityOptions = getGptImageQualityOptions(currentModel.id, selectedRoute?.line);
   const sizeOptions = getImageRouteSizeOptions(selectedRoute, baseSizeOptions);
   const effectiveSize = sizeOptions.includes(normalizedSize)
     ? normalizedSize
@@ -169,6 +173,24 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
     normalizedSize,
     restrictToDirectKeyCompatible,
     setImageLine,
+  ]);
+
+  useEffect(() => {
+    if (!isGptImage) return;
+    const normalizedQuality = normalizeGptImageQuality(
+      gptImageQuality,
+      currentModel.id,
+      selectedRoute?.line,
+    );
+    if (normalizedQuality !== gptImageQuality) {
+      setGptImageQuality(normalizedQuality);
+    }
+  }, [
+    currentModel.id,
+    gptImageQuality,
+    isGptImage,
+    selectedRoute?.line,
+    setGptImageQuality,
   ]);
 
   useEffect(() => {
@@ -318,25 +340,23 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
           </div>
         )}
 
-        {isGptImage2 && (
+        {isGptImage && (
           <div>
             <label className="mb-1 block text-[10px] text-gray-500">质量</label>
             <DropUpSelect
               value={gptImageQuality}
               onChange={(value) =>
-                setGptImageQuality(value as 'auto' | 'low' | 'medium' | 'high')
+                setGptImageQuality(value as 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max')
               }
-              options={[
-                { value: 'auto', label: '自动' },
-                { value: 'low', label: '低' },
-                { value: 'medium', label: '中' },
-                { value: 'high', label: '高' },
-              ]}
+              options={gptQualityOptions.map((value) => ({
+                value,
+                label: ({ auto: '自动', low: '低', medium: '中', high: '高', xhigh: '超高', max: '极高' } as Record<string, string>)[value],
+              }))}
             />
           </div>
         )}
 
-        {isGptImage2 && (
+        {isGptImage && (
           <div>
             <label className="mb-1 block text-[10px] text-gray-500">格式</label>
             <DropUpSelect
@@ -353,7 +373,7 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
           </div>
         )}
 
-        {isGptImage2 && (
+        {isGptImage && (
           <div>
             <label className="mb-1 block text-[10px] text-gray-500">压缩率</label>
             <input
@@ -369,7 +389,7 @@ export const ImageFormConfig: React.FC<ImageFormConfigProps> = ({
           </div>
         )}
 
-        {isGptImage2 && (
+        {isGptImage && (
           <div>
             <label className="mb-1 block text-[10px] text-gray-500">审核强度</label>
             <DropUpSelect

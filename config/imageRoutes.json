@@ -140,6 +140,75 @@
         }
       },
       "sortOrder": 110
+    },
+    {
+      "id": "gpt-image-2.5-sunburst-line1",
+      "label": "Line 1",
+      "description": "GPT-image-2.5 Sunburst VIP low-cost async image generation route",
+      "modelFamily": "gpt-image-2.5-sunburst",
+      "line": "line1",
+      "transport": "openai-image",
+      "mode": "async",
+      "baseUrl": "https://vip.aittco.com",
+      "generatePath": "/v1/images/generations?async=true",
+      "taskPath": "/v1/images/tasks/{taskId}",
+      "editPath": "/v1/images/edits?async=true",
+      "useRequestModel": true,
+      "allowUserApiKeyWithoutLogin": false,
+      "apiKeyEnv": "IMAGE_ROUTE_VIP_KEYS",
+      "pointCost": 3,
+      "sizeOverrides": {
+        "1k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 2.5 },
+        "2k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 3 },
+        "4k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 3.5 }
+      },
+      "sortOrder": 200
+    },
+    {
+      "id": "gpt-image-2.5-sunburst-line2",
+      "label": "Line 2",
+      "description": "GPT-image-2.5 Sunburst high-quality native image generation route",
+      "modelFamily": "gpt-image-2.5-sunburst",
+      "line": "line2",
+      "transport": "openai-image",
+      "mode": "sync",
+      "baseUrl": "https://rolldek.com",
+      "generatePath": "/v1/images/generations",
+      "taskPath": "",
+      "editPath": "/v1/images/edits",
+      "useRequestModel": true,
+      "allowUserApiKeyWithoutLogin": false,
+      "apiKeyEnv": "IMAGE_ROLL_IMAGE2.5_BIG",
+      "pointCost": 4,
+      "sizeOverrides": {
+        "1k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 3.5 },
+        "2k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 4 },
+        "4k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 4.5 }
+      },
+      "sortOrder": 210
+    },
+    {
+      "id": "gpt-image-2.5-sunburst-line3",
+      "label": "Line 3",
+      "description": "GPT-image-2.5 Sunburst official key image generation route",
+      "modelFamily": "gpt-image-2.5-sunburst",
+      "line": "line3",
+      "transport": "openai-image",
+      "mode": "sync",
+      "baseUrl": "https://rolldek.com",
+      "generatePath": "/v1/images/generations",
+      "taskPath": "",
+      "editPath": "/v1/images/edits",
+      "useRequestModel": true,
+      "allowUserApiKeyWithoutLogin": false,
+      "apiKeyEnv": "IMAGE_ROLL_IMAGE2.5_MAX",
+      "pointCost": 5.5,
+      "sizeOverrides": {
+        "1k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 5 },
+        "2k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 5.5 },
+        "4k": { "upstreamModel": "gpt-image-2.5-sunburst", "pointCost": 6 }
+      },
+      "sortOrder": 220
     }
   ]
 }

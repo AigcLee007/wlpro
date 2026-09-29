@@ -26,6 +26,7 @@ import {
 import {
   getImageModelById,
   getImageModelEffectiveRequestSize,
+  isGptImageModel,
 } from '../src/config/imageModels';
 import { useImageRouteCatalog } from '../src/hooks/useImageRouteCatalog';
 import { useImageModelCatalog } from '../src/hooks/useImageModelCatalog';
@@ -605,7 +606,7 @@ const ControlPanel: React.FC<ControlPanelProps> = React.memo(({ onInitGeneration
 
     const max = isVideoMode
       ? getVideoModelMaxReferenceImages(selectedVideoModelConfig.id)
-      : (imageModel === 'gpt-image-2' ? 16 : 10);
+      : (isGptImageModel(imageModel) ? 16 : 10);
     
     // DEBUG ALERT
     // alert(`[Debug] Drop: Max=${max}, Current=${referenceImages.length}, IsVideo=${isVideoMode}, Model=${videoModel}`);
@@ -672,7 +673,7 @@ const ControlPanel: React.FC<ControlPanelProps> = React.memo(({ onInitGeneration
       const files = Array.from(e.target.files);
       const max = isVideoMode
         ? getVideoModelMaxReferenceImages(selectedVideoModelConfig.id)
-        : (imageModel === 'gpt-image-2' ? 16 : 10);
+        : (isGptImageModel(imageModel) ? 16 : 10);
       const remainingSlots = max - referenceImages.length;
 
       if (remainingSlots <= 0) {
@@ -942,9 +943,8 @@ const ControlPanel: React.FC<ControlPanelProps> = React.memo(({ onInitGeneration
         }
       : {};
 
-    const isGptImage2RequestModel = (model: string) =>
-      model === 'gpt-image-2' || model === 'gpt-image-2-all';
-    const isGptImage2Model = imageModel === 'gpt-image-2' || isGptImage2RequestModel(modelName);
+    const isGptImage2RequestModel = (model: string) => isGptImageModel(model);
+    const isGptImage2Model = isGptImageModel(imageModel) || isGptImage2RequestModel(modelName);
     const promptWithoutAr = parsedPrompt.replace(/\s*--ar\s*\d+\s*[:：]\s*\d+/gi, '').trim();
     const promptWithRatio = `${promptWithoutAr} --ar ${effectiveRatio}`;
     const currentPrompt = isGptImage2Model ? promptWithoutAr : promptWithRatio;
@@ -1694,7 +1694,7 @@ const ControlPanel: React.FC<ControlPanelProps> = React.memo(({ onInitGeneration
   ];
   const maxReferenceImages = isVideoMode
     ? getVideoModelMaxReferenceImages(selectedVideoModelConfig.id)
-    : (imageModel === 'gpt-image-2' ? 16 : 10);
+    : (isGptImageModel(imageModel) ? 16 : 10);
   const promptReferenceMentionState = useMemo(() => {
     const referenceTagRegex = /@图\s*([1-9]\d*)/gi;
     const mentionedOneBased: number[] = [];

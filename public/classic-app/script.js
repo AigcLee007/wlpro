@@ -63,6 +63,15 @@ let classicPricingCatalog = {
       defaultSize: "2k",
       selectorCost: 1,
     },
+    {
+      id: "gpt-image-2.5-sunburst",
+      label: "GPT-image-2.5 Sunburst",
+      routeFamily: "gpt-image-2.5-sunburst",
+      requestModel: "gpt-image-2.5-sunburst",
+      sizeOptions: ["1k", "2k", "4k"],
+      defaultSize: "2k",
+      selectorCost: 2.5,
+    },
   ],
   routes: [
     { id: "nano-banana-pro-line1", label: "Line 1", modelFamily: "nano-banana", line: "line1", pointCost: 10 },
@@ -101,6 +110,42 @@ let classicPricingCatalog = {
       sizeOverrides: {
         "2k": { upstreamModel: "gpt-image-2", pointCost: 3 },
         "4k": { upstreamModel: "gpt-image-2", pointCost: 4 },
+      },
+    },
+    {
+      id: "gpt-image-2.5-sunburst-line1",
+      label: "Line 1",
+      modelFamily: "gpt-image-2.5-sunburst",
+      line: "line1",
+      pointCost: 3,
+      sizeOverrides: {
+        "1k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 2.5 },
+        "2k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 3 },
+        "4k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 3.5 },
+      },
+    },
+    {
+      id: "gpt-image-2.5-sunburst-line2",
+      label: "Line 2",
+      modelFamily: "gpt-image-2.5-sunburst",
+      line: "line2",
+      pointCost: 4,
+      sizeOverrides: {
+        "1k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 3.5 },
+        "2k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 4 },
+        "4k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 4.5 },
+      },
+    },
+    {
+      id: "gpt-image-2.5-sunburst-line3",
+      label: "Line 3",
+      modelFamily: "gpt-image-2.5-sunburst",
+      line: "line3",
+      pointCost: 5.5,
+      sizeOverrides: {
+        "1k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 5 },
+        "2k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 5.5 },
+        "4k": { upstreamModel: "gpt-image-2.5-sunburst", pointCost: 6 },
       },
     },
   ],
@@ -945,7 +990,7 @@ function parseAspectRatio(ratioText) {
 }
 
 function isClassicGptImageModel(modelId = imageModel) {
-  return String(modelId || "").trim() === "gpt-image-2";
+  return ["gpt-image-2", "gpt-image-2.5-sunburst"].includes(String(modelId || "").trim());
 }
 
 function getCurrentRefImageLimit(modelId = imageModel) {
@@ -969,8 +1014,13 @@ function getClassicGptSettings() {
     const quality = String(localStorage.getItem(GPT_IMAGE_QUALITY_KEY) || GPT_IMAGE_DEFAULTS.quality).trim().toLowerCase();
     const outputFormat = String(localStorage.getItem(GPT_IMAGE_OUTPUT_FORMAT_KEY) || GPT_IMAGE_DEFAULTS.outputFormat).trim().toLowerCase();
     const moderation = String(localStorage.getItem(GPT_IMAGE_MODERATION_KEY) || GPT_IMAGE_DEFAULTS.moderation).trim().toLowerCase();
+    const qualityOptions = getClassicGptQualityOptions();
+    const normalizedQuality = qualityOptions.includes(quality) ? quality : GPT_IMAGE_DEFAULTS.quality;
+    if (normalizedQuality !== quality) {
+      localStorage.setItem(GPT_IMAGE_QUALITY_KEY, normalizedQuality);
+    }
     return {
-      quality: ["auto", "low", "medium", "high"].includes(quality) ? quality : GPT_IMAGE_DEFAULTS.quality,
+      quality: normalizedQuality,
       outputFormat: ["png", "jpeg", "webp"].includes(outputFormat) ? outputFormat : GPT_IMAGE_DEFAULTS.outputFormat,
       outputCompression: readClassicGptOutputCompression(),
       moderation: ["auto", "low"].includes(moderation) ? moderation : GPT_IMAGE_DEFAULTS.moderation,
@@ -978,6 +1028,15 @@ function getClassicGptSettings() {
   } catch (_) {
     return { ...GPT_IMAGE_DEFAULTS };
   }
+}
+
+function getClassicGptQualityOptions() {
+  const route = getClassicSelectedRoute(getClassicModelConfig());
+  const modelId = String(imageModel || "").trim();
+  if (modelId === "gpt-image-2.5-sunburst" && ["line2", "line3"].includes(normalizeClassicLine(route?.line))) {
+    return ["auto", "low", "medium", "high", "xhigh", "max"];
+  }
+  return ["auto", "low", "medium", "high"];
 }
 
 function setClassicGptCompression(value) {
@@ -1053,6 +1112,12 @@ function updateClassicGptSettingsUi() {
   const formatPill = document.getElementById("gptOutputFormatPill");
   const moderationPill = document.getElementById("gptModerationPill");
   const compressionInput = document.getElementById("gptOutputCompressionInput");
+  const qualityOptions = getClassicGptQualityOptions();
+  const qualityPillItems = qualityPill?.querySelectorAll(".dropdown-item") || [];
+  qualityPillItems.forEach((item) => {
+    const value = String(item.getAttribute("data-value") || "").trim().toLowerCase();
+    item.style.display = qualityOptions.includes(value) ? "" : "none";
+  });
 
   const syncPill = (pill, value) => {
     if (!pill) return;
@@ -1491,6 +1556,7 @@ window.selectPill = function(pillId, element, costLabel = null) {
     updateModelUI();
   } else if (pillId === 'linePill') {
     localStorage.setItem('nb_line', normalizeClassicLine(val));
+    updateClassicGptSettingsUi();
   } else if (pillId === 'grokRefModePill') {
     const mode = val === "classic_multi" ? "classic_multi" : "stable_fusion";
     localStorage.setItem(GROK_REF_MODE_KEY, mode);
@@ -1646,7 +1712,7 @@ function getClassicModelLabel(model = {}) {
   const id = String(model?.id || "").trim();
   const label = String(model?.label || id || "模型").trim();
   if (id === "nano-banana") return `🍌🍌 ${label}`;
-  if (id === "gpt-image-2") return `✨ ${label}`;
+  if (["gpt-image-2", "gpt-image-2.5-sunburst"].includes(id)) return `✨ ${label}`;
   return label;
 }
 
@@ -2016,6 +2082,7 @@ window.refreshClassicCatalogUi = function () {
   enforceClassicBrandHeader();
   renderClassicModelOptions();
   renderClassicLineOptions(getClassicModelConfig(imageModel));
+  updateClassicGptSettingsUi();
   updateCurrentPriceCard();
   renderPriceTable();
 };
@@ -3013,7 +3080,8 @@ async function runGen() {
   // 模型映射表
   const MODEL_MAP = {
     'nano-banana': 'nano-banana-pro',
-    'gpt-image-2': 'gpt-image-2'
+    'gpt-image-2': 'gpt-image-2',
+    'gpt-image-2.5-sunburst': 'gpt-image-2.5-sunburst'
   };
 
   selectedModel = MODEL_MAP[imageModel] || 'nano-banana-pro';

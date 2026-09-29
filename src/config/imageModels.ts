@@ -15,6 +15,15 @@ export type ImageModelSizeBehavior =
   | 'doubao-v5'
   | 'doubao-v45'
   | 'z-image-turbo';
+export type GptImageQuality = 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+const GPT_IMAGE_MODEL_IDS = new Set(['gpt-image-2', 'gpt-image-2-all', 'gpt-image-2.5-sunburst']);
+const GPT_IMAGE_BASE_QUALITY_OPTIONS: GptImageQuality[] = ['auto', 'low', 'medium', 'high'];
+const GPT_IMAGE_EXTENDED_QUALITY_OPTIONS: GptImageQuality[] = [
+  ...GPT_IMAGE_BASE_QUALITY_OPTIONS,
+  'xhigh',
+  'max',
+];
 
 export interface ImageModelConfig {
   id: string;
@@ -222,6 +231,31 @@ export const getImageModelExtraAspectRatios = (modelId?: string) =>
 export const getImageModelRequestName = (modelId?: string) => {
   const model = getImageModelById(modelId);
   return model.requestModel || model.id;
+};
+
+export const isGptImageModel = (modelId?: string): boolean =>
+  GPT_IMAGE_MODEL_IDS.has(String(modelId || '').trim());
+
+export const getGptImageQualityOptions = (
+  modelId?: string,
+  imageLine?: string,
+): GptImageQuality[] => {
+  const normalizedModelId = String(modelId || '').trim();
+  const normalizedLine = String(imageLine || '').trim().toLowerCase();
+  if (normalizedModelId === 'gpt-image-2.5-sunburst' && ['line2', 'line3'].includes(normalizedLine)) {
+    return [...GPT_IMAGE_EXTENDED_QUALITY_OPTIONS];
+  }
+  return [...GPT_IMAGE_BASE_QUALITY_OPTIONS];
+};
+
+export const normalizeGptImageQuality = (
+  value: string | undefined,
+  modelId?: string,
+  imageLine?: string,
+): GptImageQuality => {
+  const options = getGptImageQualityOptions(modelId, imageLine);
+  const normalized = String(value || '').trim().toLowerCase() as GptImageQuality;
+  return options.includes(normalized) ? normalized : 'auto';
 };
 
 export const getImageModelEffectiveRequestSize = ({
